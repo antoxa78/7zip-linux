@@ -61,6 +61,7 @@ pub async fn extract_archive(
     };
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; 4096];
+    let mut stdout_buf = Vec::new();
 
     let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let pause = pause.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
@@ -100,6 +101,7 @@ pub async fn extract_archive(
                     Ok(n) => n,
                     Err(_) => break,
                 };
+                stdout_buf.extend_from_slice(&buf[..n]);
                 if let Some(ref tx) = progress_tx {
                     let text = String::from_utf8_lossy(&buf[..n]);
                     for segment in text.split('\r') {
@@ -125,11 +127,11 @@ pub async fn extract_archive(
         if let Some(ref tx) = progress_tx {
             let _ = tx.try_send(100);
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(String::from_utf8_lossy(&stdout_buf).to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        if needs_password(&stderr, &stdout) {
+        let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
+        if needs_password(&stderr, &stdout_str) {
             Err("__NEED_PASSWORD__".to_string())
         } else {
             Err(stderr)

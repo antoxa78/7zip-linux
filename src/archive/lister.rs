@@ -14,6 +14,7 @@ fn needs_password(stderr: &str, stdout: &str) -> bool {
         || combined.contains("wrong password")
         || combined.contains("cannot open")
         || combined.contains("can not open")
+        || combined.contains("encrypted")
 }
 
 pub async fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>, String> {
@@ -50,8 +51,9 @@ pub async fn list_archive_with_password(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
             let _ = std::fs::remove_dir_all(&tmp);
-            if needs_password(&stderr, "") {
+            if needs_password(&stderr, &stdout) {
                 return Err("__NEED_PASSWORD__".to_string());
             }
             return Err(stderr.to_string());
