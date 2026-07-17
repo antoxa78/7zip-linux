@@ -38,6 +38,7 @@ fn main() {
 
     let app = adw::Application::builder()
         .application_id(config::APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
 
     app.connect_activate(build_ui);
