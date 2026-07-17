@@ -251,7 +251,7 @@ fn build_ui(app: &adw::Application) {
                 .version(config::VERSION)
                 .copyright("© 2026 IdanPlusTV")
                 .license_type(gtk::License::Gpl30)
-                .website("https://github.com/7zip-linux")
+                .website("https://github.com/antoxa78/7zip-linux")
                 .build();
             about.add_credit_section(Some("Developer"), &["IdanPlusTV"]);
             about.present(crate::utils::parent_window().as_ref());
