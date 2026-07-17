@@ -3,7 +3,7 @@ pub mod settings;
 
 use std::path::PathBuf;
 
-pub const APP_ID: &str = "com.idanplus.sevenzip-linux";
+pub const APP_ID: &str = "7zip-linux";
 pub const APP_NAME: &str = "7-Zip Linux";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

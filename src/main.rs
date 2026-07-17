@@ -9,9 +9,28 @@ mod utils;
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use adw::prelude::*;
 use gtk::{gdk, gio};
+
+use crate::panels::SharedPanel;
+
+static PANEL_STATE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+fn store_panel_state(state: &SharedPanel) {
+    let ptr = Box::into_raw(Box::new(state.clone()));
+    PANEL_STATE.store(ptr as *mut std::ffi::c_void, Ordering::Relaxed);
+}
+
+fn get_panel_state() -> Option<SharedPanel> {
+    let ptr = PANEL_STATE.load(Ordering::Relaxed) as *const SharedPanel;
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { (*ptr).clone() })
+    }
+}
 
 fn main() {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
@@ -22,6 +41,26 @@ fn main() {
         .build();
 
     app.connect_activate(build_ui);
+
+    app.connect_open(move |_app, files, _hints| {
+        if let Some(state) = get_panel_state() {
+            if let Some(file) = files.first() {
+                if let Some(path) = file.path() {
+                    if path.is_dir() {
+                        crate::panels::navigate_to(&state, &path);
+                    } else if crate::archive::browse::parse_archive_path(&path).is_some()
+                        || crate::panels::is_archive_file_check(&path)
+                    {
+                        crate::archive::browse::try_open_archive(&state, &path);
+                    } else {
+                        let uri = format!("file://{}", path.display());
+                        let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+                    }
+                }
+            }
+        }
+    });
+
     app.run();
 }
 
@@ -223,31 +262,11 @@ fn build_ui(app: &adw::Application) {
     // Main panel
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
     let (panel_widget, panel_state) = panels::create_panel(&home, show_hidden.clone());
+    store_panel_state(&panel_state);
     panel_widget.set_hexpand(true);
     panel_widget.set_vexpand(true);
     main_hbox.append(&panel_widget);
     content_box.append(&main_hbox);
-
-    // Handle "Open With" from file manager
-    app.connect_open({
-        let state = panel_state.clone();
-        move |_app, files, _hints| {
-            if let Some(file) = files.first() {
-                if let Some(path) = file.path() {
-                    if path.is_dir() {
-                        crate::panels::navigate_to(&state, &path);
-                    } else if crate::archive::browse::parse_archive_path(&path).is_some()
-                        || crate::panels::is_archive_file_check(&path)
-                    {
-                        crate::archive::browse::try_open_archive(&state, &path);
-                    } else {
-                        let uri = format!("file://{}", path.display());
-                        let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
-                    }
-                }
-            }
-        }
-    });
 
     // --- Toggle hidden ---
     {
