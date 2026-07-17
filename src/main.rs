@@ -228,6 +228,27 @@ fn build_ui(app: &adw::Application) {
     main_hbox.append(&panel_widget);
     content_box.append(&main_hbox);
 
+    // Handle "Open With" from file manager
+    app.connect_open({
+        let state = panel_state.clone();
+        move |_app, files, _hints| {
+            if let Some(file) = files.first() {
+                if let Some(path) = file.path() {
+                    if path.is_dir() {
+                        crate::panels::navigate_to(&state, &path);
+                    } else if crate::archive::browse::parse_archive_path(&path).is_some()
+                        || crate::panels::is_archive_file_check(&path)
+                    {
+                        crate::archive::browse::try_open_archive(&state, &path);
+                    } else {
+                        let uri = format!("file://{}", path.display());
+                        let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+                    }
+                }
+            }
+        }
+    });
+
     // --- Toggle hidden ---
     {
         let action = gio::SimpleAction::new_stateful("toggle-hidden", None, &glib::Variant::from(false));

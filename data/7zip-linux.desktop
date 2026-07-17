@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=7-Zip Linux
 Comment=A Linux GUI for 7-Zip, inspired by the Windows File Manager
-Exec=7zip-linux
+Exec=7zip-linux %f
 Icon=7zip-linux
 Terminal=false
 Type=Application
