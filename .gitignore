@@ -1,0 +1,5 @@
+target/
+*.deb
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,23 @@
+[package]
+name = "sevenzip-gui"
+version = "1.0.0"
+edition = "2021"
+description = "A Linux GUI for 7-Zip, inspired by the Windows File Manager"
+license = "GPL-3.0-or-later"
+authors = ["IdanPlusTV"]
+
+[[bin]]
+name = "7zip-linux"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { version = "0.11", package = "gtk4", features = ["v4_18"] }
+adw = { version = "0.9", package = "libadwaita", features = ["v1_7"] }
+glib = { version = "0.22", package = "glib" }
+gio = { version = "0.22", package = "gio" }
+gdk-pixbuf = { version = "0.22", package = "gdk-pixbuf" }
+tokio = { version = "1", features = ["process", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-channel = "2"

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=7-Zip Linux
+Comment=A Linux GUI for 7-Zip, inspired by the Windows File Manager
+Exec=7zip-linux
+Icon=7zip-linux
+Terminal=false
+Type=Application
+Categories=Utility;FileTools;FileManager;
+MimeType=application/x-7z-compressed;application/x-rar;application/zip;application/gzip;application/x-tar;application/x-bzip2;application/x-xz;application/x-zstd;application/x-lz4;
+Keywords=7zip;archive;compress;extract;
+StartupNotify=true
