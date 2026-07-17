@@ -42,20 +42,26 @@ fn main() {
 
     app.connect_activate(build_ui);
 
-    app.connect_open(move |_app, files, _hints| {
-        if let Some(state) = get_panel_state() {
-            if let Some(file) = files.first() {
-                if let Some(path) = file.path() {
-                    if path.is_dir() {
-                        crate::panels::navigate_to(&state, &path);
-                    } else if crate::archive::browse::parse_archive_path(&path).is_some()
-                        || crate::panels::is_archive_file_check(&path)
-                    {
-                        crate::archive::browse::try_open_archive(&state, &path);
-                    } else {
-                        let uri = format!("file://{}", path.display());
-                        let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
-                    }
+    app.connect_open(move |app, files, _hints| {
+        // When launched with files, activate may not fire — ensure UI exists
+        let state = match get_panel_state() {
+            Some(s) => s,
+            None => {
+                build_ui(app);
+                get_panel_state().expect("build_ui must set PANEL_STATE")
+            }
+        };
+        if let Some(file) = files.first() {
+            if let Some(path) = file.path() {
+                if path.is_dir() {
+                    crate::panels::navigate_to(&state, &path);
+                } else if crate::archive::browse::parse_archive_path(&path).is_some()
+                    || crate::panels::is_archive_file_check(&path)
+                {
+                    crate::archive::browse::try_open_archive(&state, &path);
+                } else {
+                    let uri = format!("file://{}", path.display());
+                    let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
                 }
             }
         }
