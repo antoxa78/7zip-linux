@@ -172,26 +172,16 @@ pub async fn prompt_for_password(archive_name: &str) -> Option<String> {
     dialog.add_response("open", "Open");
     dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
 
-    let tx_open = tx.clone();
+    let tx1 = tx.clone();
     let entry_ref = entry.clone();
-    dialog.connect_response(Some("open"), move |_, _| {
-        let password = entry_ref.text().to_string();
-        if let Some(tx) = tx_open.borrow_mut().take() {
-            let _ = tx.send(Some(password));
-        }
-    });
-
-    let tx_cancel = tx.clone();
-    dialog.connect_response(Some("cancel"), move |_, _| {
-        if let Some(tx) = tx_cancel.borrow_mut().take() {
-            let _ = tx.send(None);
-        }
-    });
-
-    let tx_close = tx;
-    dialog.connect_closed(move |_| {
-        if let Some(tx) = tx_close.borrow_mut().take() {
-            let _ = tx.send(None);
+    dialog.connect_response(None, move |_, response| {
+        let result = if response == "open" {
+            Some(entry_ref.text().to_string())
+        } else {
+            None
+        };
+        if let Some(tx) = tx1.borrow_mut().take() {
+            let _ = tx.send(result);
         }
     });
 

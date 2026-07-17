@@ -1,6 +1,6 @@
 [package]
 name = "sevenzip-gui"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "A Linux GUI for 7-Zip, inspired by the Windows File Manager"
 license = "GPL-3.0-or-later"
