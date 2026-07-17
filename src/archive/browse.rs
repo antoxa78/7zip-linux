@@ -221,7 +221,7 @@ pub fn parse_archive_path(path: &Path) -> Option<(PathBuf, String)> {
         }
     }
     let marker = " [archive]";
-    if let Some(idx) = s.find(marker) {
+    if let Some(idx) = s.rfind(marker) {
         let archive = PathBuf::from(&s[..idx]);
         return Some((archive, String::new()));
     }
