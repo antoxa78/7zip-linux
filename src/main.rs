@@ -296,11 +296,11 @@ fn build_ui(app: &adw::Application) {
                 .application_name(config::APP_NAME)
                 .application_icon("7zip-linux")
                 .version(config::VERSION)
-                .copyright("© 2026 IdanPlusTV")
+                .copyright("© 2026 Antoxa78")
                 .license_type(gtk::License::Gpl30)
                 .website("https://github.com/antoxa78/7zip-linux")
                 .build();
-            about.add_credit_section(Some("Developer"), &["IdanPlusTV"]);
+            about.add_credit_section(Some("Developer"), &["Antoxa78"]);
             about.present(crate::utils::parent_window().as_ref());
         });
         window.add_action(&action);

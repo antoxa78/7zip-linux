@@ -4,7 +4,7 @@ version = "1.0.1"
 edition = "2021"
 description = "A Linux GUI for 7-Zip, inspired by the Windows File Manager"
 license = "GPL-3.0-or-later"
-authors = ["IdanPlusTV"]
+authors = ["Antoxa78"]
 
 [[bin]]
 name = "7zip-linux"
