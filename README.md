@@ -1,6 +1,6 @@
 # 7-Zip Linux
 
-A Linux GUI for 7-Zip, inspired by the Windows File Manager.
+A Linux GUI for 7-Zip, inspired by the 7zip Windows File Archiver www.7-zip.org.
 
 ![7-Zip Linux](data/7zip-linux.png)
 
