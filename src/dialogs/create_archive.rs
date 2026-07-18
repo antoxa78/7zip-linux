@@ -31,13 +31,15 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
         .build();
     content.append(&name_label);
 
+    let now = chrono::Local::now();
+    let timestamp = now.format("%Y-%m-%d_%H-%M-%S").to_string();
     let default_name = if paths.len() == 1 {
         let first_name = paths[0].file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("archive");
-        format!("{}.7z", first_name)
+        format!("{}_{}.7z", first_name, timestamp)
     } else {
-        "archive.7z".to_string()
+        format!("archive_{}.7z", timestamp)
     };
     let name_entry = gtk::Entry::builder()
         .text(&default_name)
@@ -193,62 +195,29 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
         let password_opt = if password.is_empty() { None } else { Some(password) };
 
         let start_build = |out_path: PathBuf, format: String, level: u32, password_opt: Option<String>, encrypt_names: bool, s: SharedPanel, paths: Vec<PathBuf>, dfb: adw::Dialog| {
-            let progress = crate::dialogs::progress::ProgressDialog::new("Creating archive...");
-            let pb = progress.progress_bar.clone();
-            let cancel = progress.cancel_flag.clone();
-            let pause = progress.pause_flag.clone();
-            let bg = progress.is_background.clone();
+            dfb.close();
 
-            let bg_bg = bg.clone();
-            progress.background_button.connect_clicked({
-                let d = progress.dialog.clone();
-                move |_| {
-                    bg_bg.store(true, std::sync::atomic::Ordering::Relaxed);
-                    d.close();
-                }
-            });
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-            progress.cancel_button.connect_clicked({
-                let cf = cancel.clone();
-                let d = progress.dialog.clone();
-                move |_| {
-                    let confirm = adw::AlertDialog::builder()
-                        .heading("Cancel")
-                        .body("Really cancel?")
-                        .build();
-                    confirm.add_response("no", "No");
-                    confirm.add_response("yes", "Yes");
-                    confirm.set_response_appearance("yes", adw::ResponseAppearance::Destructive);
-                    let cf = cf.clone();
-                    let d = d.clone();
-                    confirm.connect_response(None, move |_, resp| {
-                        if resp == "yes" {
-                            cf.store(true, std::sync::atomic::Ordering::Relaxed);
-                            d.close();
-                        }
-                    });
-                    confirm.present(crate::utils::parent_window().as_ref());
-                }
-            });
-
-            progress.present();
+            {
+                let sb = s.borrow();
+                sb.progress_bar.set_visible(true);
+                sb.progress_bar.set_fraction(0.0);
+                sb.progress_bar.set_text(Some("0%"));
+                sb.status_label.set_label("Creating archive...");
+            }
 
             let (tx, rx) = async_channel::bounded::<u8>(32);
             let s_for_rx = s.clone();
             let rx_handle = glib::spawn_future_local(async move {
                 while let Ok(pct) = rx.recv().await {
-                    if bg.load(std::sync::atomic::Ordering::Relaxed) {
-                        let sb = s_for_rx.borrow_mut();
-                        sb.progress_bar.set_fraction(pct as f64 / 100.0);
-                        sb.progress_bar.set_text(Some(&format!("{}%", pct)));
-                        sb.progress_bar.set_visible(true);
-                        sb.status_label.set_label(&format!("Creating archive... {}%", pct));
-                    } else {
-                        pb.set_fraction(pct as f64 / 100.0);
-                        pb.set_text(Some(&format!("{}%", pct)));
-                    }
+                    let sb = s_for_rx.borrow();
+                    sb.progress_bar.set_fraction(pct as f64 / 100.0);
+                    sb.progress_bar.set_text(Some(&format!("{}%", pct)));
+                    sb.status_label.set_label(&format!("Creating archive... {}%", pct));
                 }
-                let sb = s_for_rx.borrow_mut();
+                let sb = s_for_rx.borrow();
                 sb.progress_bar.set_visible(false);
                 sb.status_label.set_label("");
             });
@@ -270,7 +239,6 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
                     let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
                     let result = crate::archive::creator::create_archive(&out_path, &refs, &options, Some(tx), Some(cancel), Some(pause)).await;
 
-                    progress.close();
                     drop(rx_handle);
 
                     match result {
@@ -291,8 +259,6 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
                     }
                 }
             });
-
-            dfb.close();
         };
 
         let s_build = state.clone();
@@ -316,6 +282,7 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
             let d = d_build.clone();
             let op = out_path.clone();
             let name_entry_focus = name_entry.clone();
+            let dfb_for_conflict = d_build.clone();
             conflict.connect_response(None, move |_, resp| {
                 if resp == "overwrite" {
                     let _ = std::fs::remove_file(&op);

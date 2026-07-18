@@ -76,9 +76,11 @@ impl ProgressDialog {
 
         let pf = pause_flag.clone();
         let pb = pause_button.clone();
+        let bg_btn = background_button.clone();
         pause_button.connect_clicked(move |_| {
             let was_paused = pf.fetch_xor(true, Ordering::Relaxed);
             pb.set_label(if was_paused { "Pause" } else { "Resume" });
+            bg_btn.set_sensitive(was_paused);
         });
 
         Self {

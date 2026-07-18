@@ -29,13 +29,17 @@ pub fn open_archive(state: &SharedPanel, archive_path: &Path, archive_name: &str
     }
 
     glib::spawn_future_local(async move {
+        eprintln!("[OPEN] open_archive: path={}", archive_path.display());
         match super::lister::list_archive_with_password(&archive_path, None).await {
             Ok(entries) => {
+                eprintln!("[OPEN] listing succeeded without password, {} entries", entries.len());
                 populate_archive(&s, &virtual_path, &archive_name, &entries);
             }
             Err(e) if e == "__NEED_PASSWORD__" => {
+                eprintln!("[OPEN] password required, prompting...");
                 match prompt_for_password(&archive_name).await {
                     Some(password) => {
+                        eprintln!("[OPEN] password entered, retrying listing...");
                         match super::lister::list_archive_with_password(
                             &archive_path,
                             Some(&password),
@@ -43,6 +47,7 @@ pub fn open_archive(state: &SharedPanel, archive_path: &Path, archive_name: &str
                         .await
                         {
                             Ok(entries) => {
+                                eprintln!("[OPEN] listing succeeded with password, {} entries", entries.len());
                                 s.borrow_mut().current_password = Some(password);
                                 populate_archive(&s, &virtual_path, &archive_name, &entries);
                             }
@@ -98,6 +103,8 @@ fn populate_archive(
     s.progress_bar.set_visible(false);
     s.raw_store.remove_all();
     s.current_path = PathBuf::from(virtual_path);
+    s.archive_entries = entries.to_vec();
+    s.archive_virtual_root = virtual_path.to_string();
     let idx = s.history_index;
     let cp = s.current_path.clone();
     s.history.truncate(idx + 1);
@@ -109,13 +116,13 @@ fn populate_archive(
     let parent = FileItem::new("..", "..", true, 0, 0, 0, 0, "Directory");
     s.raw_store.append(&parent);
 
+    let mut count = 0usize;
     for entry in entries {
-        let name = if entry.name.ends_with('/') {
-            entry.name[..entry.name.len() - 1].to_string()
-        } else {
-            entry.name.clone()
-        };
-        let display_name = name.rsplit('/').next().unwrap_or(&name).to_string();
+        let entry_name = entry.name.trim_end_matches('/');
+        if entry_name.contains('/') {
+            continue;
+        }
+        let display_name = entry_name.rsplit('/').next().unwrap_or(entry_name).to_string();
         let full_virtual = format!("{}/{}", virtual_path, entry.name);
         let file_type = if entry.is_dir {
             String::from("Directory")
@@ -137,10 +144,11 @@ fn populate_archive(
             &file_type,
         );
         s.raw_store.append(&item);
+        count += 1;
     }
 
     s.status_label
-        .set_label(&format!("{} items (in archive)", entries.len()));
+        .set_label(&format!("{} items (in archive)", count));
 }
 
 fn show_error_dialog(e: &str) {
@@ -187,12 +195,20 @@ pub async fn prompt_for_password(archive_name: &str) -> Option<String> {
 
     dialog.present(crate::utils::parent_window().as_ref());
 
+    let entry_focus = entry.clone();
+    glib::idle_add_local_once(move || {
+        entry_focus.grab_focus();
+    });
+
     rx.await.unwrap_or(None)
 }
 
 pub fn try_open_archive(state: &SharedPanel, path: &Path) {
+    eprintln!("[TRY] try_open_archive: {}", path.display());
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         open_archive(state, path, name);
+    } else {
+        eprintln!("[TRY] no file_name in path!");
     }
 }
 

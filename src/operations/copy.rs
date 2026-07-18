@@ -1,6 +1,6 @@
 use std::path::Path;
 
-pub async fn copy_file(source: &Path, dest: &Path) -> Result<(), String> {
+pub async fn copy_file(source: &Path, dest: &Path, password: Option<&str>) -> Result<(), String> {
     if let Some((archive_path, internal_path)) =
         crate::archive::browse::parse_archive_path(source)
     {
@@ -16,7 +16,7 @@ pub async fn copy_file(source: &Path, dest: &Path) -> Result<(), String> {
             &archive_path,
             &internal_path,
             &dest_dir,
-            None,
+            password,
         )
         .await;
     }
@@ -27,7 +27,7 @@ pub async fn copy_file(source: &Path, dest: &Path) -> Result<(), String> {
             let entry = entry.map_err(|e| e.to_string())?;
             let src = entry.path();
             let dst = dest.join(entry.file_name());
-            Box::pin(copy_file(&src, &dst)).await?;
+            Box::pin(copy_file(&src, &dst, password)).await?;
         }
         Ok(())
     } else {

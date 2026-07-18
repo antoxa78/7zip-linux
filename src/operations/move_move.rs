@@ -1,6 +1,6 @@
 use std::path::Path;
 
-pub async fn move_file(source: &Path, dest: &Path) -> Result<(), String> {
+pub async fn move_file(source: &Path, dest: &Path, password: Option<&str>) -> Result<(), String> {
     if let Some((archive_path, internal_path)) =
         crate::archive::browse::parse_archive_path(source)
     {
@@ -12,13 +12,20 @@ pub async fn move_file(source: &Path, dest: &Path) -> Result<(), String> {
         } else {
             dest.parent().unwrap_or(Path::new(".")).to_path_buf()
         };
-        return crate::archive::extractor::extract_entry(
+        crate::archive::extractor::extract_entry(
             &archive_path,
             &internal_path,
             &dest_dir,
-            None,
+            password,
         )
-        .await;
+        .await?;
+        crate::archive::creator::delete_entry_from_archive(
+            &archive_path,
+            &internal_path,
+            password,
+        )
+        .await?;
+        return Ok(());
     }
 
     std::fs::rename(source, dest).map_err(|e| e.to_string())

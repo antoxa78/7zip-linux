@@ -181,13 +181,16 @@ fn add_property_row(grid: &gtk::Grid, row: i32, label: &str, value: &str) {
 
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_dir() {
-                    total += dir_size(&entry.path());
-                } else {
-                    total += meta.len();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        stack.push(entry.path());
+                    } else {
+                        total += meta.len();
+                    }
                 }
             }
         }
