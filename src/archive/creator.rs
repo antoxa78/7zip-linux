@@ -33,6 +33,10 @@ pub async fn create_archive(
     cancel: Option<Arc<AtomicBool>>,
     pause: Option<Arc<AtomicBool>>,
 ) -> Result<String, String> {
+    if options.format == "tar" || options.format.starts_with("tar.") {
+        return create_tar_archive(output, files, options, progress_tx, cancel, pause).await;
+    }
+
     let mx_level = match options.level {
         0 => 0,
         1 => 1,
@@ -156,6 +160,95 @@ pub async fn create_archive(
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+async fn create_tar_archive(
+    output: &Path,
+    files: &[&Path],
+    options: &ArchiveOptions,
+    progress_tx: Option<async_channel::Sender<u8>>,
+    cancel: Option<Arc<AtomicBool>>,
+    pause: Option<Arc<AtomicBool>>,
+) -> Result<String, String> {
+    if options.password.is_some() || options.encrypt_file_names {
+        return Err("tar archives cannot be encrypted".to_string());
+    }
+    if options.split_size.is_some() {
+        return Err("Splitting tar archives is not supported".to_string());
+    }
+
+    let mut args = Vec::new();
+    match options.format.as_str() {
+        "tar" => args.push("-cf".to_string()),
+        "tar.gz" => args.push("-czf".to_string()),
+        "tar.bz2" => args.push("-cjf".to_string()),
+        "tar.xz" => args.push("-cJf".to_string()),
+        "tar.zst" => {
+            args.push("--zstd".to_string());
+            args.push("-cf".to_string());
+        }
+        _ => return Err(format!("Unsupported tar format: {}", options.format)),
+    }
+    args.push(output.to_string_lossy().to_string());
+    args.push("--".to_string());
+    args.extend(files.iter().map(|file| file.to_string_lossy().to_string()));
+
+    let mut child = tokio::process::Command::new("tar")
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to run tar: {}", e))?;
+
+    let child_id = child
+        .id()
+        .ok_or_else(|| "tar process exited immediately".to_string())?;
+    let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let pause = pause.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let mut was_paused = false;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("Cancelled".to_string());
+        }
+
+        let is_paused = pause.load(Ordering::Relaxed);
+        if is_paused && !was_paused {
+            #[cfg(unix)]
+            {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-STOP", &child_id.to_string()])
+                    .status()
+                    .await;
+            }
+            was_paused = true;
+        } else if !is_paused && was_paused {
+            #[cfg(unix)]
+            {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-CONT", &child_id.to_string()])
+                    .status()
+                    .await;
+            }
+            was_paused = false;
+        }
+
+        match child.try_wait().map_err(|e| format!("tar failed: {}", e))? {
+            Some(status) => {
+                if status.success() {
+                    if let Some(ref tx) = progress_tx {
+                        let _ = tx.send(100).await;
+                    }
+                    return Ok(String::new());
+                }
+                return Err(format!("tar failed with status {}", status));
+            }
+            None => sleep(Duration::from_millis(100)).await,
+        }
     }
 }
 

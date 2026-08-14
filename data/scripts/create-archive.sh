@@ -114,7 +114,9 @@ case "$NAME" in
     *) NAME="$NAME.$EXT" ;;
 esac
 
+OUTPUT_EXISTED="FALSE"
 if [ -e "$NAME" ]; then
+    OUTPUT_EXISTED="TRUE"
     run_centered_question "Create Archive" \
         "The archive already exists:\n$NAME\n\nOverwrite it?" \
         "Overwrite" "Cancel" || exit 0
@@ -214,7 +216,7 @@ show_progress() {
     return "$status"
 }
 
-compress() {
+run_with_progress() {
     local progress_dir
     local log
     local fifo
@@ -222,6 +224,7 @@ compress() {
     local response
     local status
     local paused="FALSE"
+    local command=("$@")
 
     progress_dir=$(mktemp -d) || return 1
     log="$progress_dir/7z.log"
@@ -229,7 +232,7 @@ compress() {
     : > "$log"
     mkfifo "$fifo" || { rm -rf "$progress_dir"; return 1; }
 
-    7z a -bsp1 "$@" > "$log" 2>&1 &
+    "${command[@]}" > "$log" 2>&1 &
     pid=$!
 
     while process_running "$pid"; do
@@ -277,6 +280,10 @@ compress() {
     return "$status"
 }
 
+compress() {
+    run_with_progress 7z a -bsp1 "$@"
+}
+
 fail() {
     run_centered_message error "Create Archive" "$1"
     exit 1
@@ -291,12 +298,19 @@ if [ "$ENCRYPTION" = "Encrypt contents + file names" ] && [ "$CTYPE" != "-t7z" ]
 fi
 
 TMPTAR=""
+ARCHIVE_COMPLETE="FALSE"
 cleanup() {
     [ -z "$TMPTAR" ] || rm -f "$TMPTAR"
+    if [ "$ARCHIVE_COMPLETE" != "TRUE" ] && [ "$OUTPUT_EXISTED" != "TRUE" ]; then
+        rm -f "$NAME"
+    fi
 }
 trap cleanup EXIT
 
-if [ "$CTYPE" = "targz" ] || [ "$CTYPE" = "tarbz2" ] || [ "$CTYPE" = "tarxz" ] || [ "$CTYPE" = "tarzst" ]; then
+if [ "$CTYPE" = "tarzst" ]; then
+    command -v tar >/dev/null 2>&1 || fail "tar is required to create tar.zst archives."
+    run_with_progress tar --zstd -cf "$NAME" -- "$@" || fail "Failed to create tar.zst archive."
+elif [ "$CTYPE" = "targz" ] || [ "$CTYPE" = "tarbz2" ] || [ "$CTYPE" = "tarxz" ]; then
     TMPTAR="$(mktemp "${NAME%.*}.XXXXXX")" || fail "Could not create temporary file."
     rm -f "$TMPTAR"
     TMPTAR="$TMPTAR.tar"
@@ -308,4 +322,5 @@ else
     compress "$CTYPE" "-mx=$MX" "${PASS_ARGS[@]}" "$NAME" "$@" || fail "Failed to create archive."
 fi
 
+ARCHIVE_COMPLETE="TRUE"
 run_centered_message info "Create Archive" "Archive created: $NAME"
