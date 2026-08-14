@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub const APP_ID: &str = "com.idanplus.sevenzip-linux";
 pub const APP_NAME: &str = "7-Zip Linux";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const BUILD_DATE_TIME: &str = env!("BUILD_DATE_TIME");
 
 pub fn config_dir() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));

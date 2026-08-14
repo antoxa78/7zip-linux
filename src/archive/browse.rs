@@ -70,8 +70,16 @@ pub fn open_archive(state: &SharedPanel, archive_path: &Path, archive_name: &str
                             src.remove();
                         }
                         sb.progress_bar.set_visible(false);
-                        sb.path_entry.set_text(&archive_path.to_string_lossy());
-                        sb.status_label.set_label("");
+                        let inside_archive =
+                            crate::archive::browse::parse_archive_path(&sb.current_path).is_some();
+                        drop(sb);
+                        if inside_archive {
+                            crate::panels::load_directory(&s);
+                        } else if let Some(parent) = archive_path.parent() {
+                            crate::panels::navigate_to(&s, parent);
+                        } else {
+                            crate::panels::load_directory(&s);
+                        }
                     }
                 }
             }

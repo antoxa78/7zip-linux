@@ -5,11 +5,11 @@ use gtk::gio;
 
 use crate::panels::SharedPanel;
 
-pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
+pub fn show(state: &SharedPanel, paths: &[PathBuf], password_protect: bool) {
     let current = { state.borrow().current_path.clone() };
 
     let dialog = adw::Dialog::builder()
-        .title("Create Archive")
+        .title(if password_protect { "Password Protect Archive" } else { "Create Archive" })
         .content_width(500)
         .content_height(420)
         .build();
@@ -102,8 +102,24 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
         .label("Encrypt file names")
         .margin_top(4)
         .build();
+    encrypt_names_check.set_tooltip_text(Some("Only the 7z format supports encrypting file names"));
+    if password_protect {
+        encrypt_names_check.set_active(true);
+    }
     enc_box.append(&encrypt_names_check);
     content.append(&enc_box);
+
+    {
+        let chk = encrypt_names_check.clone();
+        let combo = fmt_combo.clone();
+        combo.connect_selected_notify(move |c| {
+            let is_7z = c.selected() == 0;
+            chk.set_sensitive(is_7z);
+            if !is_7z {
+                chk.set_active(false);
+            }
+        });
+    }
 
     // Output path
     let out_label = gtk::Label::builder()
@@ -173,6 +189,7 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
     let state = state.clone();
     let paths: Vec<PathBuf> = paths.to_vec();
     let dialog_for_build = dialog.clone();
+    let password_entry_focus = password_entry.clone();
     build_button.connect_clicked(move |_| {
         let name = name_entry.text().to_string();
         let fmt_idx = fmt_combo.selected();
@@ -188,8 +205,29 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
         };
         let level = level_combo.selected();
         let password = password_entry.text().to_string();
-        let encrypt_names = encrypt_names_check.is_active();
+        let encrypt_names = encrypt_names_check.is_active() && format == "7z";
         let output_dir = PathBuf::from(out_entry.text().to_string());
+
+        if !password.is_empty() && format.starts_with("tar") {
+            let alert = adw::AlertDialog::builder()
+                .heading("Encryption Not Supported")
+                .body("tar archives cannot be encrypted. Choose the 7z or zip format.")
+                .build();
+            alert.add_response("ok", "OK");
+            alert.present(crate::utils::parent_window().as_ref());
+            return;
+        }
+
+        if password_protect && password.is_empty() {
+            let alert = adw::AlertDialog::builder()
+                .heading("Password Required")
+                .body("Enter a password to protect the archive.")
+                .build();
+            alert.add_response("ok", "OK");
+            alert.present(crate::utils::parent_window().as_ref());
+            password_entry.grab_focus();
+            return;
+        }
 
         let out_path = output_dir.join(&name);
         let password_opt = if password.is_empty() { None } else { Some(password) };
@@ -298,4 +336,8 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf]) {
     });
 
     dialog.present(crate::utils::parent_window().as_ref());
+
+    if password_protect {
+        password_entry_focus.grab_focus();
+    }
 }

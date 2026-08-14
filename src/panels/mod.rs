@@ -1030,7 +1030,7 @@ fn ctx_create_archive(state: &SharedPanel) {
     if paths.is_empty() {
         return;
     }
-    crate::dialogs::create_archive::show(state, &paths);
+    crate::dialogs::create_archive::show(state, &paths, false);
 }
 
 fn ctx_add_to_archive(state: &SharedPanel) {

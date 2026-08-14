@@ -203,6 +203,9 @@ fn build_ui(app: &adw::Application) {
     let btn_create_archive = make_tool_button("document-new-symbolic", "Archive", "Create Archive");
     toolbar_row.append(&btn_create_archive);
 
+    let btn_password_protect = make_tool_button("password-protect-archive-symbolic", "Password Protect", "Password Protect Archive");
+    toolbar_row.append(&btn_password_protect);
+
     let btn_add_to_archive = make_tool_button("list-add-symbolic", "Add to Archive", "Add selected files to an existing archive");
     toolbar_row.append(&btn_add_to_archive);
 
@@ -311,6 +314,7 @@ fn build_ui(app: &adw::Application) {
                 .website("https://github.com/antoxa78/7zip-linux")
                 .build();
             about.add_credit_section(Some("Developer"), &["Antoxa78"]);
+            about.add_credit_section(Some("Build Date"), &[config::BUILD_DATE_TIME]);
             about.present(crate::utils::parent_window().as_ref());
         });
         window.add_action(&action);
@@ -930,8 +934,21 @@ Icon=package-new"
         btn_create_archive.connect_clicked(move |_| {
             let paths = panels::get_all_selected_paths(&ps);
             if !paths.is_empty() {
-                dialogs::create_archive::show(&ps, &paths);
+                dialogs::create_archive::show(&ps, &paths, false);
             }
+        });
+    }
+
+    {
+        let ps = panel_state.clone();
+        btn_password_protect.connect_clicked(move |_| {
+            let paths = panels::get_all_selected_paths(&ps);
+            if paths.is_empty() {
+                crate::utils::show_info("Password Protect Archive",
+                    "Select files first, then choose Password Protect Archive.");
+                return;
+            }
+            dialogs::create_archive::show(&ps, &paths, true);
         });
     }
 
