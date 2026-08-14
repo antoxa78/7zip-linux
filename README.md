@@ -20,7 +20,7 @@ A Linux GUI for 7-Zip, inspired by the 7zip Windows File Archiver www.7-zip.org.
 ### Debian/Ubuntu
 
 ```bash
-sudo dpkg -i release/7zip-linux_1.0.0_amd64.deb
+sudo dpkg -i release/7zip-linux_1.0.7_amd64.deb
 sudo apt install -f  # install dependencies
 ```
 

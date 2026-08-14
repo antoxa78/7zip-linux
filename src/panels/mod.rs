@@ -2096,17 +2096,11 @@ fn open_archive_entry(state: &SharedPanel, archive: &Path, internal: &str) {
             let files = [gio::File::for_path(&dest)];
             if let Err(e) = app_info.launch(&files, None::<&gio::AppLaunchContext>) {
                 crate::utils::show_error("Open Failed", &e.to_string());
-            } else {
-                let d = dest.clone();
-                glib::timeout_add_seconds_once(10, move || { let _ = std::fs::remove_file(&d); });
             }
         } else {
             let uri = format!("file://{}", dest.display());
             if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
                 crate::utils::show_error("Open Failed", &e.to_string());
-            } else {
-                let d = dest.clone();
-                glib::timeout_add_seconds_once(10, move || { let _ = std::fs::remove_file(&d); });
             }
         }
     });
