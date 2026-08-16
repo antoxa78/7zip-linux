@@ -15,7 +15,8 @@ fn needs_password(stderr: &str, stdout: &str) -> bool {
         || combined.contains("wrong password")
         || combined.contains("cannot open")
         || combined.contains("can not open")
-        || combined.contains("encrypted")
+        || combined.contains("encrypted = +")
+        || combined.contains("nohdr-password")
 }
 
 pub async fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>, String> {
