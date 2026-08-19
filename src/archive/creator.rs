@@ -3,6 +3,46 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
+fn read_only_format(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if name.ends_with(".rar") {
+        Some("RAR")
+    } else if name.ends_with(".arj") {
+        Some("ARJ")
+    } else if name.ends_with(".cab") {
+        Some("CAB")
+    } else if name.ends_with(".chm") {
+        Some("CHM")
+    } else if name.ends_with(".cpio") {
+        Some("CPIO")
+    } else if name.ends_with(".deb") {
+        Some("DEB")
+    } else if name.ends_with(".dmg") {
+        Some("DMG")
+    } else if name.ends_with(".iso") {
+        Some("ISO")
+    } else if name.ends_with(".lzh") || name.ends_with(".lha") {
+        Some("LZH")
+    } else if name.ends_with(".rpm") {
+        Some("RPM")
+    } else if name.ends_with(".squashfs") {
+        Some("SquashFS")
+    } else if name.ends_with(".vhd") || name.ends_with(".vmdk") {
+        Some("VHD/VMDK")
+    } else if name.ends_with(".xar") {
+        Some("XAR")
+    } else {
+        None
+    }
+}
+
+pub fn is_read_only_archive(path: &Path) -> bool {
+    read_only_format(path).is_some()
+}
+
 pub struct ArchiveOptions {
     pub format: String,
     pub level: u32,
@@ -257,6 +297,12 @@ pub async fn add_to_archive(
     files: &[&Path],
     password: Option<&str>,
 ) -> Result<String, String> {
+    if let Some(fmt) = read_only_format(archive) {
+        return Err(format!(
+            "{} archives are read-only and cannot be modified.\nExtract the files, make changes, and repack the archive instead.",
+            fmt
+        ));
+    }
     let mut args = vec![
         "a".to_string(),
         "-y".to_string(),
@@ -295,6 +341,12 @@ pub async fn add_directory_to_archive(
     dir_name: &str,
     password: Option<&str>,
 ) -> Result<String, String> {
+    if let Some(fmt) = read_only_format(archive) {
+        return Err(format!(
+            "{} archives are read-only and cannot be modified.\nExtract the files, make changes, and repack the archive instead.",
+            fmt
+        ));
+    }
     let temp_base = std::env::temp_dir().join("sevenzip-gui-newdir");
     let _ = std::fs::create_dir_all(&temp_base);
     let new_dir = temp_base.join(dir_name);
@@ -341,6 +393,12 @@ pub async fn add_files_into_archive_path(
     password: Option<&str>,
     progress_tx: Option<async_channel::Sender<u8>>,
 ) -> Result<(), String> {
+    if let Some(fmt) = read_only_format(archive) {
+        return Err(format!(
+            "{} archives are read-only and cannot be modified.\nExtract the files, make changes, and repack the archive instead.",
+            fmt
+        ));
+    }
     let temp_base = std::env::temp_dir().join("sevenzip-gui-internal");
     let _ = std::fs::create_dir_all(&temp_base);
     let target_dir = if internal_prefix.is_empty() {
@@ -443,6 +501,12 @@ pub async fn delete_entry_from_archive(
     internal_path: &str,
     password: Option<&str>,
 ) -> Result<(), String> {
+    if let Some(fmt) = read_only_format(archive) {
+        return Err(format!(
+            "{} archives are read-only and cannot be modified.\nExtract the files, make changes, and repack the archive instead.",
+            fmt
+        ));
+    }
     let mut args = vec![
         "d".to_string(),
         "-y".to_string(),
@@ -480,6 +544,12 @@ pub async fn rename_entry_in_archive(
     new_name: &str,
     password: Option<&str>,
 ) -> Result<(), String> {
+    if let Some(fmt) = read_only_format(archive) {
+        return Err(format!(
+            "{} archives are read-only and cannot be modified.\nExtract the files, make changes, and repack the archive instead.",
+            fmt
+        ));
+    }
     let new_path = if let Some(slash) = old_path.rfind('/') {
         format!("{}/{}", &old_path[..slash + 1], new_name)
     } else {

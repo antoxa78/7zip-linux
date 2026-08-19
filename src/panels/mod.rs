@@ -279,6 +279,15 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
         let is_move = !is_ctrl;
         let s3 = s_for_drop2.clone();
         glib::spawn_future_local(async move {
+            if in_archive && crate::archive::creator::is_read_only_archive(&archive_path) {
+                crate::utils::show_error(
+                    "Drop Failed",
+                    &format!(
+                        "This archive format is read-only and cannot be modified.\nExtract the files, make changes, and repack the archive instead."
+                    ),
+                );
+                return;
+            }
             if in_archive {
                 let (tx, rx) = async_channel::bounded::<u8>(32);
                 {
@@ -311,8 +320,7 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
                 }
                 if let Err(e) = add_result {
                     crate::utils::show_error("Drop Failed", &e);
-                }
-                if is_move {
+                } else if is_move {
                     let drag_tmp = std::env::temp_dir().join("sevenzip-gui-drag");
                     for path in &paths {
                         if let Ok(rel) = path.strip_prefix(&drag_tmp) {
@@ -1536,7 +1544,10 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
                     let pw = s.current_password.as_deref();
                     match extract_to_temp(&archive, &internal, pw) {
                         Some(tmp) => tmp,
-                        None => path,
+                        None => {
+                            eprintln!("[DRAG] failed to extract {} from archive, skipping", path_str);
+                            continue;
+                        }
                     }
                 } else {
                     path
@@ -1617,6 +1628,13 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
                 .is_some_and(|d| d.device().modifier_state().contains(gdk::ModifierType::CONTROL_MASK));
             let is_move = !is_ctrl;
             glib::spawn_future_local(async move {
+                if in_archive && crate::archive::creator::is_read_only_archive(&archive_path) {
+                    crate::utils::show_error(
+                        "Drop Failed",
+                        "This archive format is read-only and cannot be modified.\nExtract the files, make changes, and repack the archive instead.",
+                    );
+                    return;
+                }
                 if in_archive {
                     let refs: Vec<&std::path::Path> = paths.iter().map(|pb| pb.as_path()).collect();
                     let internal_prefix = if is_dir {
@@ -1664,8 +1682,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
                     }
                     if let Err(e) = add_result {
                         crate::utils::show_error("Drop Failed", &e);
-                    }
-                    if is_move {
+                    } else if is_move {
                         let drag_tmp = std::env::temp_dir().join("sevenzip-gui-drag");
                         for path in &paths {
                             if let Ok(rel) = path.strip_prefix(&drag_tmp) {
