@@ -143,36 +143,28 @@ fn parse_listing(stdout: &str) -> Result<Vec<ArchiveEntry>, String> {
 
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 5 {
-            let date = parts[0];
-            let _time = parts[1];
-            let attrs = parts[2];
-            let size_str = parts[3];
-
-            if date == "Date" || date.starts_with("-") {
+        // The attributes column ("d....", "....a", ...) is always present and is the
+        // reliable anchor to locate a row, since headless formats (gzip, bzip2, xz...)
+        // omit the date and time columns in the "7z l -ba" output.
+        for (i, token) in parts.iter().enumerate() {
+            if token.len() != 5 || !token.chars().all(|c| c == '.' || "DRHSAN".contains(c)) {
                 continue;
             }
-
-            if attrs.len() != 5 || !attrs.chars().all(|c| c == '.' || "DRHSAN".contains(c)) {
+            if i + 2 >= parts.len() {
                 continue;
             }
-
-            let size = size_str.parse::<u64>().unwrap_or(0);
-            let is_dir = attrs.contains('D');
-
-            let (comp_str, name) = if parts.len() >= 6 && parts[4].parse::<u64>().is_ok() {
-                (parts[4], parts[5..].join(" "))
-            } else if parts.len() >= 6 {
-                ("0", parts[4..].join(" "))
-            } else {
-                ("0", parts[4..].join(" "))
+            let size = match parts[i + 1].parse::<u64>() {
+                Ok(size) => size,
+                Err(_) => continue,
             };
+            let comp = parts[i + 2].parse::<u64>().unwrap_or(0);
 
+            let name = parts[i + 3..].join(" ");
             if name.is_empty() {
                 continue;
             }
 
-            let comp = comp_str.parse::<u64>().unwrap_or(0);
+            let is_dir = token.contains('D');
             let method = if is_dir {
                 String::from("DIR")
             } else {
@@ -186,8 +178,68 @@ fn parse_listing(stdout: &str) -> Result<Vec<ArchiveEntry>, String> {
                 compressed_size: comp,
                 method,
             });
+            break;
         }
     }
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_zip_listing_with_date_columns() {
+        let stdout = "\
+Date      Time    Attr         Size   Compressed  Name
+------------------- ----- ------------ ------------  ------------------------
+2026-08-05 15:12:02 D....            0            0  src
+2026-08-05 11:17:47 .....          191          130  src/main.tsx
+------------------- ----- ------------ ------------  ------------------------
+                                                       2 files
+";
+        let entries = parse_listing(stdout).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_dir);
+        assert_eq!(entries[0].name, "src");
+        assert!(!entries[1].is_dir);
+        assert_eq!(entries[1].name, "src/main.tsx");
+        assert_eq!(entries[1].size, 191);
+        assert_eq!(entries[1].compressed_size, 130);
+    }
+
+    #[test]
+    fn parses_headless_listing_without_date_columns() {
+        let stdout = "\
+Type = gzip
+Headers Size = 10
+
+   Date      Time    Attr         Size   Compressed  Name
+------------------- ----- ------------ ------------  ------------------------
+                    .....       450560       136792  workspace.tar
+------------------- ----- ------------ ------------  ------------------------
+                                450560       136792  1 files
+";
+        let entries = parse_listing(stdout).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_dir);
+        assert_eq!(entries[0].name, "workspace.tar");
+        assert_eq!(entries[0].size, 450560);
+        assert_eq!(entries[0].compressed_size, 136792);
+    }
+
+    #[test]
+    fn parses_bare_listing_output() {
+        let stdout = "\
+2026-08-05 15:12:02 D....            0            0  tmp/opencode/ws/src
+2026-08-05 11:17:47 .....          191          130  tmp/opencode/ws/src/main.tsx
+2026-09-19 07:59:59 .....        16368         3703  tmp/opencode/ws/src/App.tsx
+";
+        let entries = parse_listing(stdout).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(entries[0].is_dir);
+        assert_eq!(entries[2].name, "tmp/opencode/ws/src/App.tsx");
+        assert_eq!(entries[2].size, 16368);
+    }
 }
