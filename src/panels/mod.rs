@@ -1042,18 +1042,31 @@ fn ctx_create_archive(state: &SharedPanel) {
 }
 
 fn ctx_add_to_archive(state: &SharedPanel) {
-    let target_archive = {
-        let selected = get_selected_path(state);
-        selected.or_else(|| {
-            let s = state.borrow();
-            let cur = s.current_path.to_string_lossy().to_string();
-            if cur.contains(" [archive]") {
-                crate::archive::browse::parse_archive_path(&s.current_path)
-                    .map(|(archive_path, _)| archive_path)
+    let (inside_archive, archive_from_path, internal_prefix) = {
+        let s = state.borrow();
+        if let Some((archive_path, _)) =
+            crate::archive::browse::parse_archive_path(&s.current_path)
+        {
+            let cur = s.current_path.to_string_lossy();
+            let vr = &s.archive_virtual_root;
+            let prefix = if cur.starts_with(vr.as_str()) {
+                cur[vr.len()..]
+                    .trim_start_matches('/')
+                    .trim_end_matches('/')
+                    .to_string()
             } else {
-                None
-            }
-        })
+                String::new()
+            };
+            (true, Some(archive_path), prefix)
+        } else {
+            (false, None, String::new())
+        }
+    };
+
+    let target_archive = if inside_archive {
+        archive_from_path
+    } else {
+        get_selected_path(state)
     };
     let target_archive = match target_archive {
         Some(p) if p.is_file() => p,
@@ -1088,6 +1101,7 @@ fn ctx_add_to_archive(state: &SharedPanel) {
             }
             let s2 = s.clone();
             let archive2 = archive.clone();
+            let prefix = internal_prefix.clone();
             let pw = { s2.borrow().current_password.clone() };
             glib::spawn_future_local(async move {
                 {
@@ -1097,8 +1111,8 @@ fn ctx_add_to_archive(state: &SharedPanel) {
                     sb.progress_bar.pulse();
                 }
                 let refs: Vec<&std::path::Path> = file_paths.iter().map(|pb| pb.as_path()).collect();
-                let result = crate::archive::creator::add_to_archive(
-                    &archive2, &refs, pw.as_deref(),
+                let result = crate::archive::creator::add_files_into_archive_path(
+                    &archive2, &refs, &prefix, pw.as_deref(), None,
                 ).await;
                 {
                     let sb = s2.borrow();

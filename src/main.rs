@@ -956,18 +956,31 @@ Icon=package-new"
         let ps = panel_state.clone();
         let sp = spinner.clone();
         btn_add_to_archive.connect_clicked(move |_| {
-            let target_archive = {
-                let selected = crate::panels::get_selected_path(&ps);
-                selected.or_else(|| {
-                    let s = ps.borrow();
-                    let cur = s.current_path.to_string_lossy().to_string();
-                    if cur.contains(" [archive]") {
-                        crate::archive::browse::parse_archive_path(&s.current_path)
-                            .map(|(archive_path, _)| archive_path)
+            let (inside_archive, archive_from_path, internal_prefix) = {
+                let s = ps.borrow();
+                if let Some((archive_path, _)) =
+                    crate::archive::browse::parse_archive_path(&s.current_path)
+                {
+                    let cur = s.current_path.to_string_lossy();
+                    let vr = &s.archive_virtual_root;
+                    let prefix = if cur.starts_with(vr.as_str()) {
+                        cur[vr.len()..]
+                            .trim_start_matches('/')
+                            .trim_end_matches('/')
+                            .to_string()
                     } else {
-                        None
-                    }
-                })
+                        String::new()
+                    };
+                    (true, Some(archive_path), prefix)
+                } else {
+                    (false, None, String::new())
+                }
+            };
+
+            let target_archive = if inside_archive {
+                archive_from_path
+            } else {
+                crate::panels::get_selected_path(&ps)
             };
             let target_archive = match target_archive {
                 Some(p) if p.is_file() => p,
@@ -1004,6 +1017,7 @@ Icon=package-new"
                     let ps3 = ps2.clone();
                     let sp3 = sp2.clone();
                     let archive2 = archive.clone();
+                    let prefix = internal_prefix.clone();
                     let pw = { ps3.borrow().current_password.clone() };
                     glib::spawn_future_local(async move {
                         sp3.set_spinning(true);
@@ -1014,8 +1028,8 @@ Icon=package-new"
                             sb.progress_bar.pulse();
                         }
                         let refs: Vec<&std::path::Path> = file_paths.iter().map(|pb| pb.as_path()).collect();
-                        let result = crate::archive::creator::add_to_archive(
-                            &archive2, &refs, pw.as_deref(),
+                        let result = crate::archive::creator::add_files_into_archive_path(
+                            &archive2, &refs, &prefix, pw.as_deref(), None,
                         ).await;
                         {
                             let sb = ps3.borrow();
