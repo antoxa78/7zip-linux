@@ -89,7 +89,7 @@ async fn do_list_archive(
     }
 
     let mut cmd = tokio::process::Command::new("7z");
-    cmd.arg("l").arg("-ba");
+    cmd.arg("l").arg("-slt");
     if let Some(pw) = password {
         cmd.arg(format!("-p{}", pw));
     }
@@ -140,46 +140,47 @@ async fn detect_encryption(path: &Path) -> bool {
 
 fn parse_listing(stdout: &str) -> Result<Vec<ArchiveEntry>, String> {
     let mut entries = Vec::new();
+    let mut current: Option<ArchiveEntry> = None;
+    // Only parse entry blocks after the "----------" separator that follows the
+    // archive metadata header; the block before it describes the archive itself.
+    let mut started = false;
 
     for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        // The attributes column ("d....", "....a", ...) is always present and is the
-        // reliable anchor to locate a row, since headless formats (gzip, bzip2, xz...)
-        // omit the date and time columns in the "7z l -ba" output.
-        for (i, token) in parts.iter().enumerate() {
-            if token.len() != 5 || !token.chars().all(|c| c == '.' || "DRHSAN".contains(c)) {
-                continue;
-            }
-            if i + 2 >= parts.len() {
-                continue;
-            }
-            let size = match parts[i + 1].parse::<u64>() {
-                Ok(size) => size,
-                Err(_) => continue,
-            };
-            let comp = parts[i + 2].parse::<u64>().unwrap_or(0);
-
-            let name = parts[i + 3..].join(" ");
-            if name.is_empty() {
-                continue;
-            }
-
-            let is_dir = token.contains('D');
-            let method = if is_dir {
-                String::from("DIR")
-            } else {
-                String::from("--")
-            };
-
-            entries.push(ArchiveEntry {
-                name,
-                is_dir,
-                size,
-                compressed_size: comp,
-                method,
-            });
-            break;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
         }
+        if line == "----------" {
+            started = true;
+            continue;
+        }
+        if !started {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Path = ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(ArchiveEntry {
+                name: rest.trim().to_string(),
+                is_dir: false,
+                size: 0,
+                compressed_size: 0,
+                method: String::new(),
+            });
+        } else if let Some(entry) = current.as_mut() {
+            if let Some(v) = line.strip_prefix("Size = ") {
+                entry.size = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("Packed Size = ") {
+                entry.compressed_size = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("Attributes = ") {
+                entry.is_dir = v.trim().contains('D');
+            }
+        }
+    }
+
+    if let Some(entry) = current.take() {
+        entries.push(entry);
     }
 
     Ok(entries)
@@ -190,36 +191,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_zip_listing_with_date_columns() {
+    fn parses_listing_with_nested_files_and_dirs() {
         let stdout = "\
-Date      Time    Attr         Size   Compressed  Name
-------------------- ----- ------------ ------------  ------------------------
-2026-08-05 15:12:02 D....            0            0  src
-2026-08-05 11:17:47 .....          191          130  src/main.tsx
-------------------- ----- ------------ ------------  ------------------------
-                                                       2 files
+----------
+Path = src
+Size = 0
+Packed Size = 0
+Modified = 2026-08-05 15:12:02.0000000
+Attributes = D
+CRC = 
+
+Path = src/main.tsx
+Size = 191
+Packed Size = 130
+Modified = 2026-08-05 11:17:47.0000000
+Attributes = A
+CRC = 
+
+Path = src/App.tsx
+Size = 16368
+Packed Size = 3703
+Modified = 2026-09-19 07:59:59.0000000
+Attributes = A
+CRC = 
 ";
         let entries = parse_listing(stdout).unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert!(entries[0].is_dir);
         assert_eq!(entries[0].name, "src");
         assert!(!entries[1].is_dir);
         assert_eq!(entries[1].name, "src/main.tsx");
         assert_eq!(entries[1].size, 191);
         assert_eq!(entries[1].compressed_size, 130);
+        assert_eq!(entries[2].size, 16368);
     }
 
     #[test]
-    fn parses_headless_listing_without_date_columns() {
+    fn parses_headless_listing_without_attributes() {
         let stdout = "\
+Path = t.tar.gz
 Type = gzip
 Headers Size = 10
 
-   Date      Time    Attr         Size   Compressed  Name
-------------------- ----- ------------ ------------  ------------------------
-                    .....       450560       136792  workspace.tar
-------------------- ----- ------------ ------------  ------------------------
-                                450560       136792  1 files
+----------
+Path = workspace.tar
+Size = 450560
+Packed Size = 136792
+Modified = 
+Host OS = Unix
+CRC = 
+
 ";
         let entries = parse_listing(stdout).unwrap();
         assert_eq!(entries.len(), 1);
@@ -230,16 +251,109 @@ Headers Size = 10
     }
 
     #[test]
-    fn parses_bare_listing_output() {
+    fn parses_solid_archive_with_missing_packed_sizes() {
         let stdout = "\
-2026-08-05 15:12:02 D....            0            0  tmp/opencode/ws/src
-2026-08-05 11:17:47 .....          191          130  tmp/opencode/ws/src/main.tsx
-2026-09-19 07:59:59 .....        16368         3703  tmp/opencode/ws/src/App.tsx
+Path = /tmp/simpledlna-1.0.7z
+Type = 7z
+Physical Size = 1342690
+Headers Size = 557
+Method = LZMA:22 BCJ2
+Solid = +
+Blocks = 2
+
+----------
+Path = sdlna.exe
+Size = 160256
+Packed Size = 1341649
+Modified = 2014-10-21 00:15:02.0000000
+Attributes = A
+CRC = 73FE04AE
+Encrypted = -
+Method = BCJ2 LZMA:22 LZMA:20:lc0:lp2 LZMA:20:lc0:lp2
+Block = 1
+
+Path = SimpleDLNA.exe
+Size = 415744
+Packed Size = 
+Modified = 2014-10-21 00:15:02.0000000
+Attributes = A
+CRC = 8DFC0065
+Encrypted = -
+Method = BCJ2 LZMA:22 LZMA:20:lc0:lp2 LZMA:20:lc0:lp2
+Block = 1
+
+Path = x86/SQLite.Interop.dll
+Size = 891392
+Packed Size = 
+Modified = 2014-10-16 06:58:52.0000000
+Attributes = A
+CRC = 7D99EECC
+Encrypted = -
+Method = BCJ2 LZMA:22 LZMA:20:lc0:lp2 LZMA:20:lc0:lp2
+Block = 1
+
+Path = x64/SQLite.Interop.dll
+Size = 1136128
+Packed Size = 
+Modified = 2014-10-16 06:58:52.0000000
+Attributes = A
+CRC = 7D99EECC
+Encrypted = -
+Method = BCJ2 LZMA:22 LZMA:20:lc0:lp2 LZMA:20:lc0:lp2
+Block = 1
+
+Path = x86
+Size = 0
+Packed Size = 0
+Modified = 2014-10-21 00:16:29.0000000
+Attributes = D
+CRC = 
+Encrypted = -
+Method = 
+Block = 
+
+Path = x64
+Size = 0
+Packed Size = 0
+Modified = 2014-10-21 00:16:29.0000000
+Attributes = D
+CRC = 
+Encrypted = -
+Method = 
+Block = 
 ";
         let entries = parse_listing(stdout).unwrap();
-        assert_eq!(entries.len(), 3);
-        assert!(entries[0].is_dir);
-        assert_eq!(entries[2].name, "tmp/opencode/ws/src/App.tsx");
-        assert_eq!(entries[2].size, 16368);
+        assert_eq!(entries.len(), 6);
+        assert_eq!(entries[2].name, "x86/SQLite.Interop.dll");
+        assert_eq!(entries[2].size, 891392);
+        assert!(!entries[2].is_dir);
+        assert_eq!(entries[3].name, "x64/SQLite.Interop.dll");
+        assert_eq!(entries[3].size, 1136128);
+        assert!(!entries[3].is_dir);
+        assert!(entries[4].is_dir);
+        assert_eq!(entries[4].name, "x86");
+        assert!(entries[5].is_dir);
+        assert_eq!(entries[5].name, "x64");
+    }
+
+    #[test]
+    fn ignores_archive_metadata_header() {
+        let stdout = "\
+Path = /tmp/test.zip
+Type = zip
+Physical Size = 1000
+
+----------
+Path = README.md
+Size = 500
+Packed Size = 300
+Modified = 2026-08-05 11:17:47.0000000
+Attributes = A
+CRC = 
+
+";
+        let entries = parse_listing(stdout).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "README.md");
     }
 }
