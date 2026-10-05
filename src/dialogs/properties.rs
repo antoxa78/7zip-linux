@@ -9,8 +9,7 @@ pub fn show(paths: &[std::path::PathBuf]) {
 
     let dialog = adw::Dialog::builder()
         .title("Properties")
-        .content_width(400)
-        .content_height(350)
+        .content_width(380)
         .build();
 
     let toolbar_view = adw::ToolbarView::new();
@@ -24,9 +23,25 @@ pub fn show(paths: &[std::path::PathBuf]) {
     content.set_margin_end(12);
     content.set_vexpand(true);
 
-    let grid = gtk::Grid::new();
-    grid.set_column_spacing(12);
-    grid.set_row_spacing(8);
+    // Header: big icon + name, then the details as a boxed list of property rows.
+    let hero = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    hero.set_margin_bottom(6);
+    let hero_icon = gtk::Image::new();
+    hero_icon.set_pixel_size(64);
+    let hero_title = gtk::Label::builder()
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["title-3"])
+        .build();
+    hero.append(&hero_icon);
+    hero.append(&hero_title);
+    content.append(&hero);
+
+    let grid = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .valign(gtk::Align::Start)
+        .build();
 
     if paths.len() == 1 {
         let path = &paths[0];
@@ -35,18 +50,21 @@ pub fn show(paths: &[std::path::PathBuf]) {
             .unwrap_or("Unknown")
             .to_string();
 
-        dialog.set_title(&format!("Properties - {}", name));
+        dialog.set_title("Properties");
+        hero_title.set_label(&name);
+        if path.is_dir() {
+            hero_icon.set_icon_name(Some("folder"));
+        } else {
+            let (ct, _) = gtk::gio::content_type_guess(Some(name.as_str()), None::<&[u8]>);
+            hero_icon.set_from_gicon(&gtk::gio::content_type_get_icon(&ct));
+        }
         let mut row = 0;
-        add_property_row(&grid, row, "Name:", &name); row += 1;
-        add_property_row(&grid, row, "Path:", &path.to_string_lossy()); row += 1;
+        add_property_row(&grid, row, "Location:", &crate::panels::display_path(path.parent().unwrap_or(path))); row += 1;
 
-        let file_type = if path.is_dir() {
-            "Directory".to_string()
-        } else if path.is_file() {
-            path.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| format!("File (.{})", e))
-                .unwrap_or_else(|| "File".to_string())
+        let file_type = if path.is_symlink() {
+            format!("Link to {}", std::fs::read_link(path).map(|t| t.display().to_string()).unwrap_or_default())
+        } else if path.is_dir() || path.is_file() {
+            crate::panels::type_description(&name, path.is_dir())
         } else if path.is_symlink() {
             "Symbolic Link".to_string()
         } else {
@@ -64,15 +82,15 @@ pub fn show(paths: &[std::path::PathBuf]) {
 
             if let Ok(modified) = metadata.modified() {
                 if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    add_property_row(&grid, row, "Modified:", &crate::utils::format::format_timestamp(dur.as_secs())); row += 1;
+                    add_property_row(&grid, row, "Modified:", &crate::utils::format::format_timestamp_full(dur.as_secs())); row += 1;
                 }
             }
 
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                add_property_row(&grid, row, "Permissions:", &format!("{:o}", metadata.mode() & 0o777)); row += 1;
-                add_property_row(&grid, row, "Owner:", &format!("{}:{}", metadata.uid(), metadata.gid())); row += 1;
+                add_property_row(&grid, row, "Permissions:", &permissions_text(metadata.mode())); row += 1;
+                add_property_row(&grid, row, "Owner:", &owner_name(metadata.uid())); row += 1;
             }
 
             if path.is_dir() {
@@ -87,8 +105,10 @@ pub fn show(paths: &[std::path::PathBuf]) {
             add_property_row(&grid, row, "Archive:", "Yes (double-click to browse)");
         }
     } else {
-        dialog.set_title(&format!("Properties - {} items", paths.len()));
-        add_property_row(&grid, 0, "Selection:", &format!("{} items", paths.len()));
+        dialog.set_title("Properties");
+        hero_icon.set_icon_name(Some("edit-select-all-symbolic"));
+        hero_icon.add_css_class("dim-label");
+        hero_title.set_label(&format!("{} items", paths.len()));
 
         let mut total_size: u64 = 0;
         let mut total_dirs: u32 = 0;
@@ -130,53 +150,55 @@ pub fn show(paths: &[std::path::PathBuf]) {
         add_property_row(&grid, 3, "Total Size:", &crate::utils::format::format_size(total_size));
     }
 
-    let scrolled = gtk::ScrolledWindow::new();
-    scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    scrolled.set_vexpand(true);
-    scrolled.set_child(Some(&grid));
-    content.append(&scrolled);
-    toolbar_view.set_content(Some(&content));
-
-    let ok_button = gtk::Button::builder()
-        .label("OK")
+    content.append(&grid);
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&content)
         .build();
-    ok_button.add_css_class("suggested-action");
-
-    let bottom_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    bottom_bar.set_margin_top(8);
-    bottom_bar.set_margin_bottom(8);
-    bottom_bar.set_margin_start(12);
-    bottom_bar.set_margin_end(12);
-    bottom_bar.set_halign(gtk::Align::End);
-    bottom_bar.set_hexpand(true);
-    bottom_bar.append(&ok_button);
-    toolbar_view.add_bottom_bar(&bottom_bar);
-
-    let dialog_ref = dialog.clone();
-    ok_button.connect_clicked(move |_| { dialog_ref.close(); });
+    toolbar_view.set_content(Some(&scrolled));
 
     dialog.set_child(Some(&toolbar_view));
 
     dialog.present(crate::utils::parent_window().as_ref());
 }
 
-fn add_property_row(grid: &gtk::Grid, row: i32, label: &str, value: &str) {
-    let lbl = gtk::Label::builder()
-        .label(label)
-        .xalign(0.0)
-        .margin_end(8)
-        .build();
-    lbl.add_css_class("dim-label");
-    grid.attach(&lbl, 0, row, 1, 1);
+/// "rw-r--r-- (644)" — readable, with the octal value for people who think in numbers.
+fn permissions_text(mode: u32) -> String {
+    let bits = mode & 0o777;
+    let mut s = String::with_capacity(9);
+    for shift in [6, 3, 0] {
+        let b = (bits >> shift) & 0o7;
+        s.push(if b & 4 != 0 { 'r' } else { '-' });
+        s.push(if b & 2 != 0 { 'w' } else { '-' });
+        s.push(if b & 1 != 0 { 'x' } else { '-' });
+    }
+    format!("{} ({:o})", s, bits)
+}
 
-    let val = gtk::Label::builder()
-        .label(value)
-        .xalign(0.0)
-        .hexpand(true)
-        .wrap(true)
-        .selectable(true)
+/// User name for a uid, from /etc/passwd; falls back to the number.
+fn owner_name(uid: u32) -> String {
+    std::fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|passwd| {
+            passwd.lines().find_map(|line| {
+                let mut f = line.split(':');
+                let name = f.next()?;
+                let _ = f.next();
+                (f.next()?.parse::<u32>().ok()? == uid).then(|| name.to_string())
+            })
+        })
+        .unwrap_or_else(|| uid.to_string())
+}
+
+fn add_property_row(list: &gtk::ListBox, _row: i32, label: &str, value: &str) {
+    let row = adw::ActionRow::builder()
+        .title(label.trim_end_matches(':'))
+        .subtitle(value)
+        .subtitle_selectable(true)
         .build();
-    grid.attach(&val, 1, row, 1, 1);
+    row.add_css_class("property");
+    list.append(&row);
 }
 
 fn dir_size(path: &Path) -> u64 {

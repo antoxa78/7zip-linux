@@ -6,7 +6,16 @@ use gtk::gio;
 use crate::panels::SharedPanel;
 
 pub fn show(state: &SharedPanel, archive_path: &PathBuf, initial_password: Option<String>) {
-    let current = { state.borrow().current_path.clone() };
+    // Default destination: the current folder — or, when browsing inside an archive,
+    // the real folder containing it (the virtual "x.7z [archive]/..." path is not a
+    // folder; 7z would create one literally named "x.7z [archive]").
+    let current = {
+        let cur = state.borrow().current_path.clone();
+        match crate::archive::browse::parse_archive_path(&cur) {
+            Some((archive, _)) => archive.parent().map(|p| p.to_path_buf()).unwrap_or(cur),
+            None => cur,
+        }
+    };
     let archive_name = archive_path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("archive")
@@ -14,129 +23,99 @@ pub fn show(state: &SharedPanel, archive_path: &PathBuf, initial_password: Optio
 
     let dialog = adw::Dialog::builder()
         .title("Extract Archive")
-        .content_width(450)
-        .content_height(350)
+        .content_width(460)
         .build();
 
     let toolbar_view = adw::ToolbarView::new();
-    let header = adw::HeaderBar::new();
+    let header = adw::HeaderBar::builder()
+        .show_start_title_buttons(false)
+        .show_end_title_buttons(false)
+        .build();
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let extract_button = gtk::Button::with_label("Extract");
+    extract_button.add_css_class("suggested-action");
+    header.pack_start(&cancel_button);
+    header.pack_end(&extract_button);
     toolbar_view.add_top_bar(&header);
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
     content.set_margin_top(12);
-    content.set_margin_bottom(12);
+    content.set_margin_bottom(18);
     content.set_margin_start(12);
     content.set_margin_end(12);
 
-    let info_label = gtk::Label::builder()
-        .label(&format!("Archive: {}", archive_name))
-        .xalign(0.0)
-        .wrap(true)
+    // --- Destination ---
+    let dest = std::rc::Rc::new(std::cell::RefCell::new(current.clone()));
+    let dest_group = adw::PreferencesGroup::builder()
+        .title(&archive_name)
         .build();
-    content.append(&info_label);
-
-    let dest_label = gtk::Label::builder()
-        .label("Extract to:")
-        .xalign(0.0)
+    let dest_row = adw::ActionRow::builder()
+        .title("Extract to")
+        .subtitle(crate::panels::display_path(&current))
+        .activatable(true)
         .build();
-    content.append(&dest_label);
-
-    let dest_entry = gtk::Entry::builder()
-        .text(&*current.to_string_lossy())
-        .hexpand(true)
-        .sensitive(false)
-        .build();
-    dest_entry.add_css_class("flat");
-    let browse_button = gtk::Button::from_icon_name("folder-open-symbolic");
-    browse_button.set_tooltip_text(Some("Browse destination folder"));
-    let dest_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    dest_row.append(&dest_entry);
-    dest_row.append(&browse_button);
-    content.append(&dest_row);
+    dest_row.add_css_class("property");
+    dest_row.add_suffix(&gtk::Image::from_icon_name("folder-open-symbolic"));
+    dest_group.add(&dest_row);
+    content.append(&dest_group);
 
     {
-        let dest_ref = dest_entry.clone();
-        browse_button.connect_clicked(move |_| {
-            let dialog = gtk::FileDialog::builder()
-                .title("Select Destination Folder")
+        let dest = dest.clone();
+        dest_row.connect_activated(move |row| {
+            let chooser = gtk::FileDialog::builder()
+                .title("Choose Where to Extract")
+                .accept_label("Select")
+                .initial_folder(&gio::File::for_path(&*dest.borrow()))
                 .build();
-            let dest_ref = dest_ref.clone();
-            dialog.select_folder(None::<&gtk::Window>, None::<&gio::Cancellable>, move |result| {
+            let dest = dest.clone();
+            let row = row.clone();
+            chooser.select_folder(crate::utils::parent_window().as_ref(), None::<&gio::Cancellable>, move |result| {
                 if let Ok(folder) = result {
                     if let Some(path) = folder.path() {
-                        dest_ref.set_text(&*path.to_string_lossy());
+                        row.set_subtitle(&crate::panels::display_path(&path));
+                        *dest.borrow_mut() = path;
                     }
                 }
             });
         });
     }
 
-    let path_label = gtk::Label::builder()
-        .label("Path mode:")
-        .xalign(0.0)
+    // --- Options ---
+    let options_group = adw::PreferencesGroup::new();
+    let path_combo = adw::ComboRow::builder()
+        .title("Folders")
+        .model(&gtk::StringList::new(&["Keep folder structure", "Put all files in one folder"]))
         .build();
-    content.append(&path_label);
-
-    let path_combo = gtk::DropDown::from_strings(&[
-        "Full paths",
-        "No paths (flat)",
-    ]);
-    path_combo.set_selected(0);
-    content.append(&path_combo);
-
-    let ow_label = gtk::Label::builder()
-        .label("Overwrite mode:")
-        .xalign(0.0)
+    options_group.add(&path_combo);
+    let ow_combo = adw::ComboRow::builder()
+        .title("If a file exists")
+        .model(&gtk::StringList::new(&["Replace it", "Skip it", "Keep both"]))
         .build();
-    content.append(&ow_label);
+    options_group.add(&ow_combo);
+    content.append(&options_group);
 
-    let ow_combo = gtk::DropDown::from_strings(&[
-        "Overwrite all",
-        "Skip existing",
-        "Auto-rename",
-    ]);
-    ow_combo.set_selected(0);
-    content.append(&ow_combo);
-
-    let pw_label = gtk::Label::builder()
-        .label("Password (if encrypted):")
-        .xalign(0.0)
+    // --- Password ---
+    let pw_group = adw::PreferencesGroup::builder()
+        .description("Only needed for encrypted archives")
         .build();
-    content.append(&pw_label);
-
-    let password_entry = gtk::PasswordEntry::builder()
-        .show_peek_icon(true)
-        .placeholder_text("Optional")
-        .hexpand(true)
+    let password_entry = adw::PasswordEntryRow::builder()
+        .title("Password")
         .build();
     if let Some(pw) = initial_password {
         password_entry.set_text(&pw);
     }
-    content.append(&password_entry);
+    pw_group.add(&password_entry);
+    content.append(&pw_group);
 
-    toolbar_view.set_content(Some(&content));
-
-    let cancel_button = gtk::Button::builder()
-        .label("Cancel")
+    let clamp = adw::Clamp::builder().maximum_size(520).child(&content).build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&clamp)
         .build();
-
-    let extract_button = gtk::Button::builder()
-        .label("Extract")
-        .build();
-    extract_button.add_css_class("suggested-action");
-
-    let bottom_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    bottom_bar.set_margin_top(8);
-    bottom_bar.set_margin_bottom(8);
-    bottom_bar.set_margin_start(12);
-    bottom_bar.set_margin_end(12);
-    bottom_bar.append(&cancel_button);
-    bottom_bar.set_halign(gtk::Align::End);
-    bottom_bar.set_hexpand(true);
-    bottom_bar.append(&extract_button);
-    toolbar_view.add_bottom_bar(&bottom_bar);
-
+    toolbar_view.set_content(Some(&scrolled));
     dialog.set_child(Some(&toolbar_view));
+    dialog.set_default_widget(Some(&extract_button));
 
     let dialog_ref = dialog.clone();
     cancel_button.connect_clicked(move |_| {
@@ -147,7 +126,7 @@ pub fn show(state: &SharedPanel, archive_path: &PathBuf, initial_password: Optio
     let archive_clone = archive_path.clone();
     let dialog_for_extract = dialog.clone();
     extract_button.connect_clicked(move |_| {
-        let dest = PathBuf::from(dest_entry.text().to_string());
+        let dest = dest.borrow().clone();
         let full_paths = path_combo.selected() == 0;
         let overwrite = match ow_combo.selected() {
             0 => crate::archive::extractor::OverwriteMode::Overwrite,
@@ -244,7 +223,7 @@ pub fn show(state: &SharedPanel, archive_path: &PathBuf, initial_password: Optio
                     }
                     let dialog = adw::AlertDialog::builder()
                         .heading("Extract Failed")
-                        .body(&e)
+                        .body(crate::utils::humanize_error(&e))
                         .build();
                     dialog.add_response("ok", "OK");
                     dialog.present(crate::utils::parent_window().as_ref());

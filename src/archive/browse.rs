@@ -4,10 +4,25 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::models::FileItem;
 use crate::panels::SharedPanel;
+use crate::utils::NEED_PASSWORD;
 
+/// Opens an archive for browsing and pushes it onto the navigation history.
 pub fn open_archive(state: &SharedPanel, archive_path: &Path, archive_name: &str) {
+    open_archive_impl(state, archive_path, archive_name, true);
+}
+
+/// Re-reads an archive whose virtual path is already the current location
+/// (e.g. after Back/Forward into a different archive) without touching history.
+pub fn reopen_archive(state: &SharedPanel, archive_path: &Path) {
+    let name = archive_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "archive".to_string());
+    open_archive_impl(state, archive_path, &name, false);
+}
+
+fn open_archive_impl(state: &SharedPanel, archive_path: &Path, archive_name: &str, push_history: bool) {
     let archive_path = archive_path.to_path_buf();
     let archive_name = archive_name.to_string();
     let s = state.clone();
@@ -20,6 +35,9 @@ pub fn open_archive(state: &SharedPanel, archive_path: &Path, archive_name: &str
         sb.path_entry.set_text(&format!("Reading {}...", archive_name));
         sb.status_label.set_label("Reading archive...");
         sb.progress_bar.set_visible(true);
+        if let Some(old) = sb.pulse_source.take() {
+            old.remove();
+        }
         let pb = sb.progress_bar.clone();
         let source = glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
             pb.pulse();
@@ -29,152 +47,126 @@ pub fn open_archive(state: &SharedPanel, archive_path: &Path, archive_name: &str
     }
 
     glib::spawn_future_local(async move {
-        eprintln!("[OPEN] open_archive: path={}", archive_path.display());
-        match super::lister::list_archive_with_password(&archive_path, None).await {
-            Ok(entries) => {
-                eprintln!("[OPEN] listing succeeded without password, {} entries", entries.len());
-                populate_archive(&s, &virtual_path, &archive_name, &entries);
-            }
-            Err(e) if e == "__NEED_PASSWORD__" => {
-                eprintln!("[OPEN] password required, prompting...");
-                match prompt_for_password(&archive_name).await {
-                    Some(password) => {
-                        eprintln!("[OPEN] password entered, retrying listing...");
-                        match super::lister::list_archive_with_password(
-                            &archive_path,
-                            Some(&password),
-                        )
-                        .await
-                        {
-                            Ok(entries) => {
-                                eprintln!("[OPEN] listing succeeded with password, {} entries", entries.len());
-                                s.borrow_mut().current_password = Some(password);
-                                populate_archive(&s, &virtual_path, &archive_name, &entries);
-                            }
-                            Err(e) => {
-                                let mut sb = s.borrow_mut();
-                                if let Some(src) = sb.pulse_source.take() {
-                                    src.remove();
-                                }
-                                sb.progress_bar.set_visible(false);
-                                sb.path_entry.set_text(&archive_path.to_string_lossy());
-                                sb.status_label.set_label("Cannot open archive");
-                                drop(sb);
-                                show_error_dialog(&e);
-                            }
-                        }
+        // Start with a password we already know for this archive, if any.
+        let mut password = s.borrow().archive_passwords.get(&archive_path).cloned();
+        loop {
+            match super::lister::list_archive_with_password(&archive_path, password.as_deref()).await {
+                Ok(entries) => {
+                    populate_archive(&s, &archive_path, &virtual_path, entries, password, push_history);
+                    return;
+                }
+                Err(e) if e == NEED_PASSWORD => {
+                    let wrong = password.is_some();
+                    if wrong {
+                        s.borrow_mut().archive_passwords.remove(&archive_path);
                     }
-                    None => {
-                        let mut sb = s.borrow_mut();
-                        if let Some(src) = sb.pulse_source.take() {
-                            src.remove();
-                        }
-                        sb.progress_bar.set_visible(false);
-                        let inside_archive =
-                            crate::archive::browse::parse_archive_path(&sb.current_path).is_some();
-                        drop(sb);
-                        if inside_archive {
-                            crate::panels::load_directory(&s);
-                        } else if let Some(parent) = archive_path.parent() {
-                            crate::panels::navigate_to(&s, parent);
-                        } else {
-                            crate::panels::load_directory(&s);
+                    match prompt_for_password_retry(&archive_name, wrong).await {
+                        Some(pw) => password = Some(pw),
+                        None => {
+                            abort_open(&s, &archive_path, push_history, None);
+                            return;
                         }
                     }
                 }
-            }
-            Err(e) => {
-                let mut sb = s.borrow_mut();
-                if let Some(src) = sb.pulse_source.take() {
-                    src.remove();
+                Err(e) => {
+                    abort_open(&s, &archive_path, push_history, Some(&e));
+                    return;
                 }
-                sb.progress_bar.set_visible(false);
-                sb.path_entry.set_text(&archive_path.to_string_lossy());
-                sb.status_label.set_label("Cannot open archive");
-                drop(sb);
-                show_error_dialog(&e);
             }
         }
     });
 }
 
-fn populate_archive(
-    state: &SharedPanel,
-    virtual_path: &str,
-    archive_name: &str,
-    entries: &[super::lister::ArchiveEntry],
-) {
-    let mut s = state.borrow_mut();
-    if let Some(src) = s.pulse_source.take() {
+fn stop_pulse(state: &SharedPanel) {
+    let mut sb = state.borrow_mut();
+    if let Some(src) = sb.pulse_source.take() {
         src.remove();
     }
-    s.progress_bar.set_visible(false);
-    s.raw_store.remove_all();
-    s.current_path = PathBuf::from(virtual_path);
-    s.archive_entries = entries.to_vec();
-    s.archive_virtual_root = virtual_path.to_string();
-    let idx = s.history_index;
-    let cp = s.current_path.clone();
-    s.history.truncate(idx + 1);
-    s.history.push(cp);
-    s.history_index = s.history.len() - 1;
-    s.path_entry
-        .set_text(&format!("{}:/", archive_name));
+    sb.progress_bar.set_visible(false);
+}
 
-    let parent = FileItem::new("..", "..", true, 0, 0, 0, 0, "Directory");
-    s.raw_store.append(&parent);
-
-    let mut count = 0usize;
-    for entry in entries {
-        let entry_name = entry.name.trim_end_matches('/');
-        if entry_name.contains('/') {
-            continue;
+/// Called when opening was cancelled or failed: go back to something sensible.
+fn abort_open(state: &SharedPanel, archive_path: &Path, push_history: bool, error: Option<&str>) {
+    stop_pulse(state);
+    let showing_this_archive = parse_archive_path(&state.borrow().current_path)
+        .map(|(a, _)| a == archive_path)
+        .unwrap_or(false);
+    if !push_history || showing_this_archive {
+        // We are "inside" the archive we could not read; leave to its folder.
+        match archive_path.parent() {
+            Some(parent) => crate::panels::navigate_to(state, parent),
+            None => crate::panels::load_directory(state),
         }
-        let display_name = entry_name.rsplit('/').next().unwrap_or(entry_name).to_string();
-        let full_virtual = format!("{}/{}", virtual_path, entry.name);
-        let file_type = if entry.is_dir {
-            String::from("Directory")
-        } else {
-            display_name
-                .rsplit('.')
-                .next()
-                .map(|e| format!(".{}", e))
-                .unwrap_or_default()
-        };
-        let item = FileItem::new(
-            &display_name,
-            &full_virtual,
-            entry.is_dir,
-            entry.size,
-            0,
-            0,
-            0,
-            &file_type,
-        );
-        s.raw_store.append(&item);
-        count += 1;
+    } else {
+        // Restore the listing we came from.
+        crate::panels::load_directory(state);
     }
+    if let Some(e) = error {
+        show_error_dialog(e);
+    }
+}
 
-    s.status_label
-        .set_label(&format!("{} items (in archive)", count));
+fn populate_archive(
+    state: &SharedPanel,
+    archive_path: &Path,
+    virtual_path: &str,
+    entries: Vec<super::lister::ArchiveEntry>,
+    password: Option<String>,
+    push_history: bool,
+) {
+    stop_pulse(state);
+    {
+        let mut s = state.borrow_mut();
+        s.archive_entries = entries;
+        s.archive_virtual_root = virtual_path.to_string();
+        // The password belongs to *this* archive only (None if it is not encrypted),
+        // so a password from a previously opened archive is never reused by accident.
+        match &password {
+            Some(pw) => {
+                s.archive_passwords.insert(archive_path.to_path_buf(), pw.clone());
+            }
+            None => {
+                s.archive_passwords.remove(archive_path);
+            }
+        }
+        s.current_password = password;
+        if push_history {
+            s.current_path = PathBuf::from(virtual_path);
+            let idx = s.history_index;
+            let cp = s.current_path.clone();
+            s.history.truncate(idx + 1);
+            s.history.push(cp);
+            s.history_index = s.history.len() - 1;
+        }
+    }
+    crate::panels::load_directory(state);
 }
 
 fn show_error_dialog(e: &str) {
     let dialog = adw::AlertDialog::builder()
         .heading("Cannot Open Archive")
-        .body(e)
+        .body(crate::utils::humanize_error(e))
         .build();
     dialog.add_response("ok", "OK");
     dialog.present(crate::utils::parent_window().as_ref());
 }
 
 pub async fn prompt_for_password(archive_name: &str) -> Option<String> {
+    prompt_for_password_retry(archive_name, false).await
+}
+
+/// Asks for a password; `wrong` changes the text to say the previous one was rejected.
+pub async fn prompt_for_password_retry(archive_name: &str, wrong: bool) -> Option<String> {
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
     let tx = Rc::new(RefCell::new(Some(tx)));
 
     let dialog = adw::AlertDialog::builder()
-        .heading("Password Required")
-        .body(format!("\"{}\" is password-protected. Enter password:", archive_name))
+        .heading(if wrong { "Wrong Password" } else { "Password Required" })
+        .body(if wrong {
+            format!("The password for \"{}\" is incorrect. Try again:", archive_name)
+        } else {
+            format!("\"{}\" is password-protected. Enter password:", archive_name)
+        })
         .build();
 
     let entry = gtk::PasswordEntry::builder()
@@ -187,6 +179,9 @@ pub async fn prompt_for_password(archive_name: &str) -> Option<String> {
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("open", "Open");
     dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("open"));
+    dialog.set_close_response("cancel");
+    entry.set_activates_default(true);
 
     let tx1 = tx.clone();
     let entry_ref = entry.clone();

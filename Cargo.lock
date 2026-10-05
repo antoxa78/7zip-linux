@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "sevenzip-gui"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "async-channel",
  "chrono",

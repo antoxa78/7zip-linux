@@ -122,14 +122,15 @@ if [ -e "$NAME" ]; then
         "Overwrite" "Cancel" || exit 0
 fi
 
+# Same levels as 7-Zip itself (and the app): Fast=3, Normal=5, Maximum=7, Ultra=9
 case "$LEVEL" in
     Store)   MX=0 ;;
     Fastest) MX=1 ;;
-    Fast)    MX=2 ;;
-    Normal)  MX=3 ;;
-    Maximum) MX=5 ;;
-    Ultra)   MX=7 ;;
-    *)       MX=3 ;;
+    Fast)    MX=3 ;;
+    Normal)  MX=5 ;;
+    Maximum) MX=7 ;;
+    Ultra)   MX=9 ;;
+    *)       MX=5 ;;
 esac
 
 ENCRYPT="FALSE"

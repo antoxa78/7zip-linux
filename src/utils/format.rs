@@ -1,9 +1,6 @@
-use std::time::UNIX_EPOCH;
+use chrono::{Datelike, Local, TimeZone};
 
 pub fn format_size(bytes: u64) -> String {
-    if bytes == 0 {
-        return String::from("--");
-    }
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = bytes as f64;
     let mut unit_idx = 0;
@@ -18,57 +15,59 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Formats a Unix timestamp in the local time zone, the way file managers do:
+/// "Today 14:05", "Yesterday 09:30", "14 Sep 18:02" (this year), "2 Mar 2025" (older).
+/// Returns an empty string for unknown (0) timestamps.
 pub fn format_timestamp(secs: u64) -> String {
     if secs == 0 {
-        return String::from("--");
+        return String::new();
     }
-    let duration = std::time::Duration::from_secs(secs);
-    let datetime = UNIX_EPOCH + duration;
-    match datetime.duration_since(UNIX_EPOCH) {
-        Ok(d) => {
-            let secs = d.as_secs();
-            let days = secs / 86400;
-            let remaining = secs % 86400;
-            let hours = remaining / 3600;
-            let minutes = (remaining % 3600) / 60;
-
-            let mut year = 1970_i64;
-            let mut days_left = days;
-            loop {
-                let days_in_year = if is_leap(year) { 366 } else { 365 };
-                if days_left < days_in_year {
-                    break;
-                }
-                days_left -= days_in_year;
-                year += 1;
-            }
-            let month_days = if is_leap(year) {
-                [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-            } else {
-                [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-            };
-            let mut month = 1u32;
-            let mut remaining_days = days_left;
-            for &md in &month_days {
-                if remaining_days < md as u64 {
-                    break;
-                }
-                remaining_days -= md as u64;
-                month += 1;
-            }
-            format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}",
-                year,
-                month,
-                remaining_days + 1,
-                hours,
-                minutes
-            )
-        }
-        Err(_) => String::from("--"),
+    let dt = match Local.timestamp_opt(secs as i64, 0).single() {
+        Some(dt) => dt,
+        None => return String::new(),
+    };
+    let today = Local::now().date_naive();
+    let date = dt.date_naive();
+    if date == today {
+        dt.format("Today %H:%M").to_string()
+    } else if today.pred_opt() == Some(date) {
+        dt.format("Yesterday %H:%M").to_string()
+    } else if date.year() == today.year() && date <= today {
+        dt.format("%-d %b %H:%M").to_string()
+    } else {
+        dt.format("%-d %b %Y").to_string()
     }
 }
 
-fn is_leap(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+/// Full local date and time, for places with room for detail (Properties).
+pub fn format_timestamp_full(secs: u64) -> String {
+    if secs == 0 {
+        return String::new();
+    }
+    match Local.timestamp_opt(secs as i64, 0).single() {
+        Some(dt) => dt.format("%-d %B %Y, %H:%M:%S").to_string(),
+        None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn timestamps() {
+        assert_eq!(format_timestamp(0), "");
+        let now = Local::now().timestamp() as u64;
+        assert!(format_timestamp(now).starts_with("Today "));
+        assert!(format_timestamp(now - 86_400).starts_with("Yesterday ") || format_timestamp(now - 86_400).starts_with("Today "));
+        // 1 Jan 2001 is always "older than this year".
+        assert!(format_timestamp(978_350_400).ends_with("2001"));
+    }
 }

@@ -43,6 +43,20 @@ pub fn is_read_only_archive(path: &Path) -> bool {
     read_only_format(path).is_some()
 }
 
+/// Maps the dialog presets (Store, Fastest, Fast, Normal, Maximum, Ultra)
+/// to 7-Zip's -mx levels, matching 7-Zip on Windows.
+pub fn mx_for_preset(preset: u32) -> u32 {
+    match preset {
+        0 => 0, // Store
+        1 => 1, // Fastest
+        2 => 3, // Fast
+        3 => 5, // Normal
+        4 => 7, // Maximum
+        5 => 9, // Ultra
+        _ => 5,
+    }
+}
+
 pub struct ArchiveOptions {
     pub format: String,
     pub level: u32,
@@ -77,15 +91,7 @@ pub async fn create_archive(
         return create_tar_archive(output, files, options, progress_tx, cancel, pause).await;
     }
 
-    let mx_level = match options.level {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 5,
-        5 => 7,
-        _ => 3,
-    };
+    let mx_level = mx_for_preset(options.level);
     let mut args = vec![
         "a".to_string(),
         format!("-t{}", options.format),
@@ -125,12 +131,14 @@ pub async fn create_archive(
         Some(id) => id,
         None => return Err("7z process exited immediately".to_string()),
     };
+    let stderr_task = super::proc::drain_stderr(&mut child);
     let mut stdout = match child.stdout.take() {
         Some(s) => s,
         None => return Err("Failed to capture 7z stdout".to_string()),
     };
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; 4096];
+    let mut stdout_buf = Vec::new();
 
     let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let pause = pause.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
@@ -172,6 +180,7 @@ pub async fn create_archive(
                     Ok(n) => n,
                     Err(_) => break,
                 };
+                stdout_buf.extend_from_slice(&buf[..n]);
                 if let Some(ref tx) = progress_tx {
                     let text = String::from_utf8_lossy(&buf[..n]);
                     for segment in text.split('\r') {
@@ -190,16 +199,19 @@ pub async fn create_archive(
         }
     }
 
-    let output = child.wait_with_output().await
+    let status = child.wait().await
         .map_err(|e| format!("7z failed: {}", e))?;
+    let stderr = super::proc::collect_stderr(stderr_task).await;
 
-    if output.status.success() {
+    if status.success() {
         if let Some(ref tx) = progress_tx {
             let _ = tx.send(100).await;
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(String::from_utf8_lossy(&stdout_buf).to_string())
+    } else if stderr.trim().is_empty() {
+        Err(String::from_utf8_lossy(&stdout_buf).to_string())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+        Err(stderr)
     }
 }
 
@@ -231,16 +243,32 @@ async fn create_tar_archive(
         _ => return Err(format!("Unsupported tar format: {}", options.format)),
     }
     args.push(output.to_string_lossy().to_string());
-    args.push("--".to_string());
-    args.extend(files.iter().map(|file| file.to_string_lossy().to_string()));
+    // Store each item relative to its own parent folder ("-C parent name"), the way
+    // 7z does, instead of the full absolute path (home/user/...).
+    for file in files {
+        let parent = file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let name = match file.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => return Err(format!("Cannot archive \"{}\"", file.display())),
+        };
+        args.push("-C".to_string());
+        args.push(parent.to_string_lossy().to_string());
+        if name.starts_with('-') {
+            // Keep names like "-foo" from being parsed as tar options.
+            args.push(format!("--add-file={}", name));
+        } else {
+            args.push(name);
+        }
+    }
 
     let mut child = tokio::process::Command::new("tar")
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to run tar: {}", e))?;
+    let stderr_task = super::proc::drain_stderr(&mut child);
 
     let child_id = child
         .id()
@@ -285,7 +313,12 @@ async fn create_tar_archive(
                     }
                     return Ok(String::new());
                 }
-                return Err(format!("tar failed with status {}", status));
+                let stderr = super::proc::collect_stderr(stderr_task).await;
+                return Err(if stderr.trim().is_empty() {
+                    format!("tar failed with status {}", status)
+                } else {
+                    stderr
+                });
             }
             None => sleep(Duration::from_millis(100)).await,
         }
@@ -336,8 +369,11 @@ pub async fn add_to_archive(
     }
 }
 
+/// Creates an empty folder `dir_name` inside the archive, under `internal_prefix`
+/// (the archive folder currently being browsed; empty for the archive root).
 pub async fn add_directory_to_archive(
     archive: &Path,
+    internal_prefix: &str,
     dir_name: &str,
     password: Option<&str>,
 ) -> Result<String, String> {
@@ -347,10 +383,22 @@ pub async fn add_directory_to_archive(
             fmt
         ));
     }
-    let temp_base = std::env::temp_dir().join("sevenzip-gui-newdir");
-    let _ = std::fs::create_dir_all(&temp_base);
-    let new_dir = temp_base.join(dir_name);
-    std::fs::create_dir(&new_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    if dir_name.is_empty() || dir_name.contains('/') || dir_name == "." || dir_name == ".." {
+        return Err(format!("\"{}\" is not a valid folder name", dir_name));
+    }
+    let prefix = internal_prefix.trim_matches('/');
+    let rel = if prefix.is_empty() {
+        dir_name.to_string()
+    } else {
+        format!("{}/{}", prefix, dir_name)
+    };
+
+    let temp_base = crate::utils::unique_temp_dir("newdir")
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    if let Err(e) = std::fs::create_dir_all(temp_base.join(&rel)) {
+        let _ = std::fs::remove_dir_all(&temp_base);
+        return Err(format!("Failed to create temp dir: {}", e));
+    }
 
     let mut args = vec![
         "a".to_string(),
@@ -360,21 +408,16 @@ pub async fn add_directory_to_archive(
         args.push(format!("-p{}", pw));
     }
     args.push(archive.to_string_lossy().to_string());
-    args.push(format!("{}/", dir_name));
+    args.push(format!("{}/", rel));
 
     let result = tokio::process::Command::new("7z")
         .current_dir(&temp_base)
         .args(&args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run 7z: {}", e))?
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("7z failed: {}", e))?;
-
-    let _ = std::fs::remove_dir_all(&new_dir);
+        .output()
+        .await;
+    let _ = std::fs::remove_dir_all(&temp_base);
+    let result = result.map_err(|e| format!("Failed to run 7z: {}", e))?;
 
     if result.status.success() {
         Ok(String::from_utf8_lossy(&result.stdout).to_string())
@@ -382,7 +425,7 @@ pub async fn add_directory_to_archive(
         let stderr = String::from_utf8_lossy(&result.stderr);
         let stdout = String::from_utf8_lossy(&result.stdout);
         let combined = format!("{} {}", stdout, stderr);
-        Err(if stderr.is_empty() { combined } else { stderr.to_string() })
+        Err(if stderr.trim().is_empty() { combined } else { stderr.to_string() })
     }
 }
 
@@ -399,10 +442,24 @@ pub async fn add_files_into_archive_path(
             fmt
         ));
     }
-    let temp_base = std::env::temp_dir().join("sevenzip-gui-internal");
-    let _ = std::fs::create_dir_all(&temp_base);
+    let internal_prefix = internal_prefix.trim_matches('/');
+    let temp_base = crate::utils::unique_temp_dir("add")
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    let result = add_files_staged(archive, files, internal_prefix, password, progress_tx, &temp_base).await;
+    let _ = std::fs::remove_dir_all(&temp_base);
+    result
+}
+
+async fn add_files_staged(
+    archive: &Path,
+    files: &[&Path],
+    internal_prefix: &str,
+    password: Option<&str>,
+    progress_tx: Option<async_channel::Sender<u8>>,
+    temp_base: &Path,
+) -> Result<(), String> {
     let target_dir = if internal_prefix.is_empty() {
-        temp_base.clone()
+        temp_base.to_path_buf()
     } else {
         temp_base.join(internal_prefix)
     };
@@ -430,7 +487,6 @@ pub async fn add_files_into_archive_path(
     }
 
     if relative_paths.is_empty() {
-        let _ = std::fs::remove_dir_all(&temp_base);
         return Err("No valid files to add".to_string());
     }
 
@@ -442,7 +498,7 @@ pub async fn add_files_into_archive_path(
     args.extend(relative_paths);
 
     let mut child = tokio::process::Command::new("7z")
-        .current_dir(&temp_base)
+        .current_dir(temp_base)
         .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -450,6 +506,7 @@ pub async fn add_files_into_archive_path(
         .spawn()
         .map_err(|e| format!("Failed to run 7z: {}", e))?;
 
+    let stderr_task = super::proc::drain_stderr(&mut child);
     let mut stdout = child.stdout.take()
         .ok_or_else(|| "Failed to capture 7z stdout".to_string())?;
     use tokio::io::AsyncReadExt;
@@ -457,8 +514,10 @@ pub async fn add_files_into_archive_path(
     let mut stdout_buf = Vec::new();
 
     loop {
-        let n = stdout.read(&mut buf).await
-            .map_err(|_| "Failed to read 7z stdout".to_string())?;
+        let n = match stdout.read(&mut buf).await {
+            Ok(n) => n,
+            Err(_) => break,
+        };
         if n == 0 {
             break;
         }
@@ -478,21 +537,56 @@ pub async fn add_files_into_archive_path(
         }
     }
 
-    let output = child.wait_with_output().await
+    let status = child.wait().await
         .map_err(|e| format!("7z failed: {}", e))?;
+    let stderr = super::proc::collect_stderr(stderr_task).await;
 
-    let _ = std::fs::remove_dir_all(&temp_base);
-
-    if output.status.success() {
+    if status.success() {
         if let Some(ref tx) = progress_tx {
             let _ = tx.send(100).await;
         }
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout_str = String::from_utf8_lossy(&stdout_buf);
         let combined = format!("{} {}", stdout_str, stderr);
-        Err(if stderr.is_empty() { combined } else { stderr.to_string() })
+        Err(if stderr.trim().is_empty() { combined } else { stderr })
+    }
+}
+
+/// Moves an entry (file or folder) to a new full path inside the same archive.
+pub async fn move_entry_in_archive(
+    archive: &Path,
+    old_path: &str,
+    new_path: &str,
+    password: Option<&str>,
+) -> Result<(), String> {
+    if let Some(fmt) = read_only_format(archive) {
+        return Err(format!(
+            "{} archives are read-only and cannot be modified.\nExtract the files, make changes, and repack the archive instead.",
+            fmt
+        ));
+    }
+    let mut args = vec!["rn".to_string(), "-y".to_string()];
+    if let Some(pw) = password {
+        args.push(format!("-p{}", pw));
+    }
+    args.push(archive.to_string_lossy().to_string());
+    args.push(old_path.trim_matches('/').to_string());
+    args.push(new_path.trim_matches('/').to_string());
+
+    let output = tokio::process::Command::new("7z")
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run 7z: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{} {}", stdout, stderr);
+        Err(if stderr.trim().is_empty() { combined } else { stderr.to_string() })
     }
 }
 

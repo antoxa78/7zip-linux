@@ -1,23 +1,32 @@
 use std::path::Path;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ArchiveEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
     pub compressed_size: u64,
     pub method: String,
+    /// Modification time (Unix seconds, 0 if unknown).
+    pub modified: u64,
 }
 
-fn needs_password(stderr: &str, stdout: &str) -> bool {
-    let combined = format!("{} {}", stderr, stdout).to_lowercase();
-    combined.contains("enter password")
-        || combined.contains("wrong password")
-        || combined.contains("cannot open")
-        || combined.contains("can not open")
-        || combined.contains("encrypted = +")
-        || combined.contains("nohdr-password")
+/// Parses 7z's "2026-08-05 15:12:02.0000000" (local time) into Unix seconds.
+fn parse_7z_time(value: &str) -> u64 {
+    use chrono::TimeZone;
+    let v = value.trim();
+    if v.len() < 19 {
+        return 0;
+    }
+    chrono::NaiveDateTime::parse_from_str(&v[..19], "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .and_then(|naive| chrono::Local.from_local_datetime(&naive).earliest())
+        .map(|dt| dt.timestamp().max(0) as u64)
+        .unwrap_or(0)
 }
+
+use super::extractor::needs_password;
+use crate::utils::NEED_PASSWORD;
 
 pub async fn list_archive(path: &Path) -> Result<Vec<ArchiveEntry>, String> {
     list_archive_with_password(path, None).await
@@ -37,8 +46,10 @@ pub async fn list_archive_with_password(
         || name.ends_with(".zst") || name.ends_with(".z");
 
     if is_single_file_compr {
-        let tmp = std::env::temp_dir().join("sevenzip-gui-list");
-        let _ = std::fs::create_dir_all(&tmp);
+        // Private temp dir per call: listing and extraction used to share one fixed
+        // directory and could delete each other's files.
+        let tmp = crate::utils::unique_temp_dir("list")
+            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
 
         let mut cmd = tokio::process::Command::new("7z");
         cmd.arg("e").arg(path).arg(format!("-o{}", tmp.display())).arg("-y");
@@ -46,32 +57,39 @@ pub async fn list_archive_with_password(
             cmd.arg(format!("-p{}", pw));
         }
 
-        let output = cmd.stdin(std::process::Stdio::null()).output().await
-            .map_err(|e| format!("Failed to run 7z: {}", e))?;
+        let output = match cmd.stdin(std::process::Stdio::null()).output().await {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(format!("Failed to run 7z: {}", e));
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             let _ = std::fs::remove_dir_all(&tmp);
             if needs_password(&stderr, &stdout) {
-                return Err("__NEED_PASSWORD__".to_string());
+                return Err(NEED_PASSWORD.to_string());
             }
             return Err(stderr.to_string());
         }
 
-        if let Ok(read_dir) = std::fs::read_dir(&tmp) {
-            for entry in read_dir.flatten() {
-                let inner = entry.path();
-                if inner.is_file() && inner != *path {
-                    let result = do_list_archive(&inner, password).await;
-                    let _ = std::fs::remove_file(&inner);
-                    let _ = std::fs::remove_dir_all(&tmp);
-                    return result;
-                }
-            }
-        }
+        let inner = std::fs::read_dir(&tmp)
+            .ok()
+            .and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.is_file()));
+        let inner_result = match inner {
+            Some(ref inner) => Some(do_list_archive(inner, password).await),
+            None => None,
+        };
         let _ = std::fs::remove_dir_all(&tmp);
-        return Err("No inner archive found".to_string());
+        match inner_result {
+            Some(Ok(entries)) => return Ok(entries),
+            Some(Err(e)) if e == NEED_PASSWORD => return Err(e),
+            // The decompressed file is not an archive itself (e.g. notes.txt.gz):
+            // show the compressed file's single entry instead of failing.
+            _ => return do_list_archive(path, password).await,
+        }
     }
 
     do_list_archive(path, password).await
@@ -84,7 +102,7 @@ async fn do_list_archive(
     if password.is_none() {
         let encrypted = detect_encryption(path).await;
         if encrypted {
-            return Err("__NEED_PASSWORD__".to_string());
+            return Err(NEED_PASSWORD.to_string());
         }
     }
 
@@ -106,7 +124,7 @@ async fn do_list_archive(
 
     if !output.status.success() {
         if needs_password(&stderr, &stdout) {
-            return Err("__NEED_PASSWORD__".to_string());
+            return Err(NEED_PASSWORD.to_string());
         }
         return Err(if stderr.is_empty() { stdout.to_string() } else { stderr });
     }
@@ -167,14 +185,20 @@ fn parse_listing(stdout: &str) -> Result<Vec<ArchiveEntry>, String> {
                 size: 0,
                 compressed_size: 0,
                 method: String::new(),
+                modified: 0,
             });
         } else if let Some(entry) = current.as_mut() {
             if let Some(v) = line.strip_prefix("Size = ") {
                 entry.size = v.trim().parse().unwrap_or(0);
             } else if let Some(v) = line.strip_prefix("Packed Size = ") {
                 entry.compressed_size = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("Modified = ") {
+                entry.modified = parse_7z_time(v);
             } else if let Some(v) = line.strip_prefix("Attributes = ") {
-                entry.is_dir = v.trim().contains('D');
+                entry.is_dir = entry.is_dir || v.trim().contains('D');
+            } else if let Some(v) = line.strip_prefix("Folder = ") {
+                // tar and some other formats report folders this way instead of via Attributes.
+                entry.is_dir = entry.is_dir || v.trim() == "+";
             }
         }
     }
@@ -224,6 +248,7 @@ CRC =
         assert_eq!(entries[1].size, 191);
         assert_eq!(entries[1].compressed_size, 130);
         assert_eq!(entries[2].size, 16368);
+        assert!(entries[0].modified > 0);
     }
 
     #[test]
@@ -334,6 +359,27 @@ Block =
         assert_eq!(entries[4].name, "x86");
         assert!(entries[5].is_dir);
         assert_eq!(entries[5].name, "x64");
+    }
+
+    #[test]
+    fn tar_folders_are_folders() {
+        let stdout = "\
+----------
+Path = website
+Folder = +
+Size = 0
+Modified = 2026-10-05 19:34:07
+Mode = drwxr-xr-x
+
+Path = website/README.md
+Folder = -
+Size = 10
+Mode = -rw-r--r--
+";
+        let entries = parse_listing(stdout).unwrap();
+        assert!(entries[0].is_dir);
+        assert!(!entries[1].is_dir);
+        assert!(entries[0].modified > 0);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -6,7 +7,6 @@ use adw::prelude::*;
 use gtk::{gdk, gio};
 
 use crate::models::FileItem;
-use crate::utils::icon_for_file;
 
 pub struct PanelState {
     pub current_path: PathBuf,
@@ -28,6 +28,13 @@ pub struct PanelState {
     pub pulse_source: Option<glib::SourceId>,
     pub archive_entries: Vec<crate::archive::lister::ArchiveEntry>,
     pub archive_virtual_root: String,
+    /// Passwords the user entered, per archive file. `current_password` is always the
+    /// entry for the archive at `archive_virtual_root` (or None), never a leftover.
+    pub archive_passwords: HashMap<PathBuf, String>,
+    /// Header bar title; shows the current folder (or archive) name and its location.
+    pub window_title: Option<adw::WindowTitle>,
+    /// Shown over the list when the folder is empty or the filter matches nothing.
+    pub empty_page: adw::StatusPage,
 }
 
 pub type SharedPanel = Rc<RefCell<PanelState>>;
@@ -47,7 +54,8 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
             return true;
         }
         if let Some(fi) = item.downcast_ref::<FileItem>() {
-            return glob_match(&pat, &fi.name());
+            // Keep the ".." row so you can always navigate up while filtering.
+            return fi.name() == ".." || glob_match(&pat, &fi.name());
         }
         true
     });
@@ -72,10 +80,11 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
     path_entry.set_placeholder_text(Some("Enter path..."));
 
     // Status label
-    let status_label = gtk::Label::new(Some("0 items"));
+    let status_label = gtk::Label::new(Some(""));
     status_label.set_xalign(0.0);
-    status_label.set_margin_start(8);
-    status_label.set_css_classes(&["caption", "dim-label", "status-label"]);
+    status_label.set_hexpand(true);
+    status_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status_label.set_css_classes(&["dim-label", "status-label"]);
 
     // Search entry
     let search_entry = gtk::SearchEntry::new();
@@ -84,12 +93,19 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
     let progress_bar = gtk::ProgressBar::builder()
         .visible(false)
         .valign(gtk::Align::Center)
-        .hexpand(true)
-        .margin_start(8)
-        .margin_end(8)
+        .halign(gtk::Align::End)
+        .width_request(220)
         .build();
-    progress_bar.add_css_class("osd");
-    progress_bar.set_size_request(-1, 20);
+    progress_bar.add_css_class("status-progress");
+
+    let empty_page = adw::StatusPage::builder()
+        .icon_name("folder-symbolic")
+        .title("This folder is empty")
+        .can_target(false)
+        .visible(false)
+        .build();
+    empty_page.add_css_class("compact");
+    empty_page.add_css_class("dim-label");
 
     let state = Rc::new(RefCell::new(PanelState {
         current_path: initial_path.to_path_buf(),
@@ -111,46 +127,63 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
         pulse_source: None,
         archive_entries: Vec::new(),
         archive_virtual_root: String::new(),
+        archive_passwords: HashMap::new(),
+        window_title: None,
+        empty_page: empty_page.clone(),
     }));
 
     setup_columns(&column_view, &state);
 
-    // Attach column_view sorter to sort_model
+    // Sort: ".." always on top, then folders, then files. The clicked column only
+    // orders items *within* those groups, so flipping a column never sinks folders
+    // below files or moves ".." to the bottom.
+    let group_sorter = gtk::CustomSorter::new(|a, b| {
+        let rank = |o: &glib::Object| -> u8 {
+            match o.downcast_ref::<FileItem>() {
+                Some(fi) if fi.name() == ".." => 0,
+                Some(fi) if fi.is_dir() => 1,
+                _ => 2,
+            }
+        };
+        rank(a).cmp(&rank(b)).into()
+    });
+    let multi_sorter = gtk::MultiSorter::new();
+    multi_sorter.append(group_sorter);
     if let Some(cv_sorter) = column_view.sorter() {
-        sort_model.set_sorter(Some(&cv_sorter));
+        multi_sorter.append(cv_sorter);
+    }
+    sort_model.set_sorter(Some(&multi_sorter));
+    if let Some(first) = column_view.columns().item(0).and_downcast::<gtk::ColumnViewColumn>() {
+        column_view.sort_by_column(Some(&first), gtk::SortType::Ascending);
     }
 
     // Navigation bar
     let nav_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    nav_bar.set_margin_top(4);
-    nav_bar.set_margin_bottom(4);
-    nav_bar.set_margin_start(4);
-    nav_bar.set_margin_end(4);
-    nav_bar.add_css_class("linked");
+    nav_bar.add_css_class("path-bar");
 
     let back_button = gtk::Button::from_icon_name("go-previous-symbolic");
-    back_button.set_tooltip_text(Some("Go Back"));
+    back_button.set_tooltip_text(Some("Back (Alt+Left)"));
     back_button.add_css_class("flat");
     let s = state.clone();
     back_button.connect_clicked(move |_| go_back(&s));
     nav_bar.append(&back_button);
 
     let forward_button = gtk::Button::from_icon_name("go-next-symbolic");
-    forward_button.set_tooltip_text(Some("Go Forward"));
+    forward_button.set_tooltip_text(Some("Forward (Alt+Right)"));
     forward_button.add_css_class("flat");
     let s = state.clone();
     forward_button.connect_clicked(move |_| go_forward(&s));
     nav_bar.append(&forward_button);
 
     let up_button = gtk::Button::from_icon_name("go-up-symbolic");
-    up_button.set_tooltip_text(Some("Go Up"));
+    up_button.set_tooltip_text(Some("Parent folder (Alt+Up)"));
     up_button.add_css_class("flat");
     let s = state.clone();
     up_button.connect_clicked(move |_| go_up(&s));
     nav_bar.append(&up_button);
 
     let refresh_button = gtk::Button::from_icon_name("view-refresh-symbolic");
-    refresh_button.set_tooltip_text(Some("Refresh"));
+    refresh_button.set_tooltip_text(Some("Reload (Ctrl+R)"));
     refresh_button.add_css_class("flat");
     let s = state.clone();
     refresh_button.connect_clicked(move |_| load_directory(&s));
@@ -158,8 +191,8 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
 
     let s = state.clone();
     path_entry.connect_activate(move |entry| {
-        let text = entry.text().to_string();
-        let path = PathBuf::from(&text);
+        let text = entry.text().trim().to_string();
+        let path = expand_home(&text);
         if path.is_dir() {
             navigate_to(&s, &path);
         } else if path.is_file() {
@@ -175,16 +208,25 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
     scrolled.set_hexpand(true);
     scrolled.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
     scrolled.set_child(Some(&column_view));
-    container.append(&scrolled);
+    let list_overlay = gtk::Overlay::new();
+    list_overlay.set_child(Some(&scrolled));
+    list_overlay.add_overlay(&empty_page);
+    container.append(&list_overlay);
 
-    let bottom_bar = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    bottom_bar.set_margin_top(4);
-    bottom_bar.set_margin_bottom(6);
-    bottom_bar.set_margin_start(4);
-    bottom_bar.set_margin_end(4);
-    bottom_bar.append(&progress_bar);
+    let bottom_bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    bottom_bar.add_css_class("statusbar");
     bottom_bar.append(&status_label);
+    bottom_bar.append(&progress_bar);
     container.append(&bottom_bar);
+
+    // Keep the status line and empty-state message in sync with filtering.
+    let s = state.clone();
+    sort_model.connect_items_changed(move |_, _, _, _| {
+        if let Ok(sb) = s.try_borrow() {
+            drop(sb);
+            update_status(&s);
+        }
+    });
 
     // Double-click to enter directory or open archive
     let s = state.clone();
@@ -237,25 +279,14 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
 
     let s_for_drop2 = state.clone();
     drop_target.connect_drop(move |ds, value, _x, _y| {
-        let (archive_path, in_archive, archive_pw, internal_prefix) = {
-            let s = s_for_drop2.borrow();
-            let cur = s.current_path.clone();
-            let in_arc = crate::archive::browse::parse_archive_path(&cur).is_some();
-            let (arc_path, pw, prefix) = if in_arc {
-                let (p, _) = crate::archive::browse::parse_archive_path(&cur)
-                    .unwrap_or((cur.clone(), String::new()));
-                let vroot = s.archive_virtual_root.clone();
-                let pref = if cur.to_string_lossy().starts_with(&vroot) {
-                    cur.to_string_lossy()[vroot.len()..].trim_start_matches('/').trim_end_matches('/').to_string()
-                } else {
-                    String::new()
-                };
-                (p, s.current_password.clone(), pref)
-            } else {
-                (cur.clone(), None, String::new())
+        let (archive_path, in_archive, archive_pw, internal_prefix) =
+            match current_archive_location(&s_for_drop2) {
+                Some((arc, prefix)) => {
+                    let pw = password_for_archive(&s_for_drop2, &arc);
+                    (arc, true, pw, prefix)
+                }
+                None => (s_for_drop2.borrow().current_path.clone(), false, None, String::new()),
             };
-            (arc_path, in_arc, pw, prefix)
-        };
         let paths: Vec<std::path::PathBuf> = if let Ok(file_list) = value.get::<gdk::FileList>() {
             file_list.files().iter().filter_map(|f| f.path()).collect()
         } else if let Ok(text) = value.get::<String>() {
@@ -354,34 +385,9 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
                 }
                 crate::panels::load_directory(&s3);
             } else {
-                let mut skip_existing = false;
-                for path in &paths {
-                    if let Some(name) = path.file_name() {
-                        let dest = archive_path.join(name);
-                        if dest.exists() && !skip_existing {
-                            match confirm_overwrite(&name.to_string_lossy()).await {
-                                0 => {
-                                    if dest.is_dir() {
-                                        let _ = std::fs::remove_dir_all(&dest);
-                                    } else {
-                                        let _ = std::fs::remove_file(&dest);
-                                    }
-                                }
-                                1 => continue,
-                                2 => { skip_existing = true; continue; }
-                                _ => break,
-                            }
-                        }
-                        if is_move {
-                            if let Err(e) = crate::operations::move_move::move_file(path, &dest, None).await {
-                                crate::utils::show_error("Drop Failed", &e);
-                            }
-                        } else if let Err(e) = crate::operations::copy::copy_file(path, &dest, None).await {
-                            crate::utils::show_error("Drop Failed", &e);
-                        }
-                    }
-                }
-                crate::panels::load_directory(&s3);
+                // Same engine as paste: no copying onto itself, no deleting the source
+                // before it has been copied, overwrite only after confirmation.
+                transfer_items(&s3, paths, None, is_move, TransferDest::Dir(archive_path)).await;
             }
         });
         true
@@ -390,20 +396,8 @@ pub fn create_panel(initial_path: &Path, show_hidden: Rc<Cell<bool>>) -> (gtk::B
 
     // Selection changed -> update status bar
     let s = state.clone();
-    selection.connect_selection_changed(move |sel, _, _| {
-        let sb = s.borrow();
-        let selected = sel.selection().size();
-        if selected > 0 {
-            let total = sb.sort_model.n_items();
-            sb.status_label.set_label(&format!("{} items ({} selected)", total, selected));
-        } else {
-            let total = sb.sort_model.n_items();
-            if crate::archive::browse::parse_archive_path(&sb.current_path).is_some() {
-                sb.status_label.set_label(&format!("{} items (in archive)", total - 1));
-            } else {
-                sb.status_label.set_label(&format!("{} items", total));
-            }
-        }
+    selection.connect_selection_changed(move |_, _, _| {
+        update_status(&s);
     });
 
     // Right-click context menu
@@ -492,53 +486,546 @@ fn register_ctx_action(
 
 // --- Selection helpers ---
 
-pub fn get_selected_path(state: &SharedPanel) -> Option<PathBuf> {
+/// The ".." row is a navigation aid, not a real item. It must never be part of a
+/// selection that gets deleted, copied, moved or archived (Ctrl+A selects it too).
+fn is_parent_row(fi: &FileItem) -> bool {
+    fi.name() == ".."
+}
+
+/// All selected items except the ".." row, in view order.
+fn selected_items(state: &SharedPanel) -> Vec<FileItem> {
     let s = state.borrow();
     let bitset = s.selection_model.selection();
-    if bitset.is_empty() {
+    let mut items = Vec::new();
+    let count = bitset.size() as u32;
+    for i in 0..count {
+        let pos = bitset.nth(i);
+        if let Some(item) = s.sort_model.item(pos) {
+            if let Ok(fi) = item.downcast::<FileItem>() {
+                if !is_parent_row(&fi) {
+                    items.push(fi);
+                }
+            }
+        }
+    }
+    items
+}
+
+pub fn get_selected_path(state: &SharedPanel) -> Option<PathBuf> {
+    selected_items(state).first().map(|fi| PathBuf::from(fi.path()))
+}
+
+pub fn get_all_selected_paths(state: &SharedPanel) -> Vec<PathBuf> {
+    selected_items(state).iter().map(|fi| PathBuf::from(fi.path())).collect()
+}
+
+pub fn get_selected_names(state: &SharedPanel) -> Vec<String> {
+    selected_items(state).iter().map(|fi| fi.name()).collect()
+}
+
+// --- Archive location / password helpers ---
+
+/// If the panel is showing the inside of an archive: (archive file, folder inside it).
+pub fn current_archive_location(state: &SharedPanel) -> Option<(PathBuf, String)> {
+    let cur = state.borrow().current_path.clone();
+    crate::archive::browse::parse_archive_path(&cur)
+        .map(|(a, internal)| (a, internal.trim_matches('/').to_string()))
+}
+
+/// The archive whose entries are currently loaded in `archive_entries`.
+pub fn loaded_archive(state: &SharedPanel) -> Option<PathBuf> {
+    let root = state.borrow().archive_virtual_root.clone();
+    if root.is_empty() {
         return None;
     }
-    let pos = bitset.nth(0);
-    if let Some(item) = s.sort_model.item(pos) {
-        if let Ok(fi) = item.downcast::<FileItem>() {
-            return Some(PathBuf::from(fi.path()));
-        }
+    crate::archive::browse::parse_archive_path(Path::new(&root)).map(|(a, _)| a)
+}
+
+/// The password we know for `archive` — never a password that belongs to another archive.
+pub fn password_for_archive(state: &SharedPanel, archive: &Path) -> Option<String> {
+    if let Some(pw) = state.borrow().archive_passwords.get(archive) {
+        return Some(pw.clone());
+    }
+    if loaded_archive(state).as_deref() == Some(archive) {
+        return state.borrow().current_password.clone();
     }
     None
 }
 
-pub fn get_all_selected_paths(state: &SharedPanel) -> Vec<PathBuf> {
-    let s = state.borrow();
-    let bitset = s.selection_model.selection();
-    let mut paths = Vec::new();
-
-    let count = bitset.size() as u32;
-    for i in 0..count {
-        let pos = bitset.nth(i);
-        if let Some(item) = s.sort_model.item(pos) {
-            if let Ok(fi) = item.downcast::<FileItem>() {
-                paths.push(PathBuf::from(fi.path()));
-            }
-        }
+/// Records a password the user entered for `archive`.
+pub fn remember_password(state: &SharedPanel, archive: &Path, password: &str) {
+    let is_loaded = loaded_archive(state).as_deref() == Some(archive);
+    let mut s = state.borrow_mut();
+    s.archive_passwords.insert(archive.to_path_buf(), password.to_string());
+    if is_loaded {
+        s.current_password = Some(password.to_string());
     }
-    paths
 }
 
-pub fn get_selected_names(state: &SharedPanel) -> Vec<String> {
-    let s = state.borrow();
-    let bitset = s.selection_model.selection();
-    let mut names = Vec::new();
+fn same_file(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
 
-    let count = bitset.size() as u32;
-    for i in 0..count {
-        let pos = bitset.nth(i);
-        if let Some(item) = s.sort_model.item(pos) {
-            if let Ok(fi) = item.downcast::<FileItem>() {
-                names.push(fi.name());
+fn join_internal(prefix: &str, name: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", prefix, name)
+    }
+}
+
+/// Re-reads the archive shown in the panel (after it was modified) and redraws.
+pub async fn refresh_current_archive_and_reload(state: &SharedPanel) {
+    if let Some((archive, _)) = current_archive_location(state) {
+        if loaded_archive(state).as_deref() == Some(archive.as_path()) {
+            let pw = password_for_archive(state, &archive);
+            match crate::archive::lister::list_archive_with_password(&archive, pw.as_deref()).await {
+                Ok(entries) => state.borrow_mut().archive_entries = entries,
+                Err(e) => crate::utils::show_error("Refresh Failed", &e),
             }
         }
     }
-    names
+    load_directory(state);
+}
+
+/// Extracts an archive entry, asking for the password (again) if 7z needs one.
+async fn extract_entry_with_prompt(
+    state: &SharedPanel,
+    archive: &Path,
+    internal: &str,
+    dest_dir: &Path,
+    password: &mut Option<String>,
+) -> Result<(), String> {
+    let archive_name = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "archive".to_string());
+    loop {
+        match crate::archive::extractor::extract_entry(archive, internal, dest_dir, password.as_deref()).await {
+            Err(e) if e == crate::utils::NEED_PASSWORD => {
+                match crate::archive::browse::prompt_for_password_retry(&archive_name, password.is_some()).await {
+                    Some(pw) => {
+                        remember_password(state, archive, &pw);
+                        *password = Some(pw);
+                    }
+                    None => return Err(e),
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+// --- Copy / cut / paste / move (one implementation for toolbar, keys, menu and drops) ---
+
+pub enum TransferDest {
+    /// A real folder on disk.
+    Dir(PathBuf),
+    /// A folder inside an archive.
+    Archive { archive: PathBuf, prefix: String, password: Option<String> },
+}
+
+fn set_progress(state: &SharedPanel, done: usize, total: usize, verb: &str) {
+    let pct = if total == 0 { 0 } else { ((done as f64 / total as f64) * 100.0) as u32 };
+    let sb = state.borrow();
+    sb.progress_bar.set_fraction(pct as f64 / 100.0);
+    sb.progress_bar.set_text(Some(&format!("{}%", pct)));
+    sb.status_label.set_label(&format!("{} {} of {}...", verb, (done + 1).min(total), total));
+}
+
+/// Copies (or moves, if `is_move`) `sources` into `dest`.
+///
+/// Guarantees:
+/// * an item is never copied onto itself (a copy in the same folder becomes "name (copy)"),
+///   and moving an item to where it already is does nothing;
+/// * a folder is never copied/moved into itself;
+/// * an existing destination is only replaced after the user confirms;
+/// * for a move, a source is deleted only after *its own* copy succeeded — skipped,
+///   cancelled and failed items are left untouched.
+///
+/// Returns the sources that were not transferred.
+pub async fn transfer_items(
+    state: &SharedPanel,
+    sources: Vec<PathBuf>,
+    src_password: Option<String>,
+    is_move: bool,
+    dest: TransferDest,
+) -> Vec<PathBuf> {
+    let total = sources.len();
+    let verb = if is_move { "Moving" } else { "Copying" };
+    {
+        let sb = state.borrow();
+        sb.progress_bar.set_visible(true);
+        sb.progress_bar.set_fraction(0.0);
+        sb.progress_bar.set_text(Some("0%"));
+        sb.status_label.set_label(&format!("{} files...", verb));
+    }
+
+    let mut src_password = src_password;
+    let mut not_done: Vec<PathBuf> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut skip_existing = false;
+    let mut cancelled = false;
+
+    for (i, src) in sources.iter().enumerate() {
+        if cancelled {
+            not_done.push(src.clone());
+            continue;
+        }
+        set_progress(state, i, total, verb);
+
+        let name = match src.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => {
+                not_done.push(src.clone());
+                continue;
+            }
+        };
+        let src_arc = match crate::archive::browse::parse_archive_path(src) {
+            Some((a, internal)) => {
+                let internal = internal.trim_matches('/').to_string();
+                if internal.is_empty() {
+                    errors.push(format!("{}: cannot copy an archive root", name));
+                    not_done.push(src.clone());
+                    continue;
+                }
+                Some((a, internal))
+            }
+            None => None,
+        };
+
+        let result: Result<(), String> = match &dest {
+            TransferDest::Dir(dir) => {
+                let mut target = dir.join(&name);
+                if src_arc.is_none() {
+                    if *src == target || same_file(src, &target) {
+                        if is_move {
+                            continue; // already there — nothing to do, nothing to delete
+                        }
+                        target = crate::utils::fsops::unique_copy_name(dir, &name, src.is_dir());
+                    } else if src.is_dir() && crate::utils::fsops::is_same_or_inside(dir, src) {
+                        errors.push(format!("{}: cannot {} a folder into itself", name, if is_move { "move" } else { "copy" }));
+                        not_done.push(src.clone());
+                        continue;
+                    }
+                }
+                if std::fs::symlink_metadata(&target).is_ok() {
+                    if skip_existing {
+                        not_done.push(src.clone());
+                        continue;
+                    }
+                    match confirm_overwrite(&name).await {
+                        0 => {}
+                        1 => { not_done.push(src.clone()); continue; }
+                        2 => { skip_existing = true; not_done.push(src.clone()); continue; }
+                        _ => { cancelled = true; not_done.push(src.clone()); continue; }
+                    }
+                }
+                match &src_arc {
+                    Some((arc, internal)) => {
+                        let r = extract_entry_with_prompt(state, arc, internal, dir, &mut src_password).await;
+                        if r.is_ok() && is_move {
+                            if let Err(e) = crate::archive::creator::delete_entry_from_archive(
+                                arc, internal, src_password.as_deref(),
+                            ).await {
+                                errors.push(format!("{}: copied, but could not be removed from the archive: {}", name, crate::utils::humanize_error(&e)));
+                            }
+                        }
+                        r
+                    }
+                    None if is_move => crate::operations::move_move::move_file(src, &target, None).await,
+                    None => crate::operations::copy::copy_file(src, &target, None).await,
+                }
+            }
+            TransferDest::Archive { archive, prefix, password } => {
+                let dest_internal = join_internal(prefix, &name);
+                let same_archive_src = src_arc
+                    .as_ref()
+                    .filter(|(a, _)| same_file(a, archive))
+                    .map(|(_, internal)| internal.clone());
+                if let Some(ref si) = same_archive_src {
+                    if *si == dest_internal {
+                        continue; // pasted onto itself — nothing to do
+                    }
+                    if dest_internal.starts_with(&format!("{}/", si)) {
+                        errors.push(format!("{}: cannot {} a folder into itself", name, if is_move { "move" } else { "copy" }));
+                        not_done.push(src.clone());
+                        continue;
+                    }
+                }
+                let exists = loaded_archive(state).is_some_and(|a| same_file(&a, archive))
+                    && state.borrow().archive_entries.iter()
+                        .any(|e| e.name.trim_matches('/') == dest_internal);
+                if exists {
+                    if skip_existing {
+                        not_done.push(src.clone());
+                        continue;
+                    }
+                    match confirm_overwrite(&name).await {
+                        0 => {}
+                        1 => { not_done.push(src.clone()); continue; }
+                        2 => { skip_existing = true; not_done.push(src.clone()); continue; }
+                        _ => { cancelled = true; not_done.push(src.clone()); continue; }
+                    }
+                }
+                if let (Some(si), true) = (&same_archive_src, is_move) {
+                    // Move inside one archive: a rename, no extract/re-add needed.
+                    crate::archive::creator::move_entry_in_archive(archive, si, &dest_internal, password.as_deref()).await
+                } else if let Some((arc, internal)) = &src_arc {
+                    match crate::utils::unique_temp_dir("paste") {
+                        Err(e) => Err(format!("Failed to create temp dir: {}", e)),
+                        Ok(tmp) => {
+                            let mut r = extract_entry_with_prompt(state, arc, internal, &tmp, &mut src_password).await;
+                            if r.is_ok() {
+                                let staged = tmp.join(&name);
+                                r = crate::archive::creator::add_files_into_archive_path(
+                                    archive, &[staged.as_path()], prefix, password.as_deref(), None,
+                                ).await;
+                            }
+                            let _ = std::fs::remove_dir_all(&tmp);
+                            if r.is_ok() && is_move {
+                                if let Err(e) = crate::archive::creator::delete_entry_from_archive(
+                                    arc, internal, src_password.as_deref(),
+                                ).await {
+                                    errors.push(format!("{}: copied, but could not be removed from the source archive: {}", name, crate::utils::humanize_error(&e)));
+                                }
+                            }
+                            r
+                        }
+                    }
+                } else {
+                    let r = crate::archive::creator::add_files_into_archive_path(
+                        archive, &[src.as_path()], prefix, password.as_deref(), None,
+                    ).await;
+                    if r.is_ok() && is_move {
+                        if let Err(e) = crate::utils::fsops::remove_path(src) {
+                            errors.push(format!("{}: added to the archive, but the original could not be deleted: {}", name, e));
+                        }
+                    }
+                    r
+                }
+            }
+        };
+
+        if let Err(e) = result {
+            errors.push(format!("{}: {}", name, crate::utils::humanize_error(&e)));
+            not_done.push(src.clone());
+        }
+    }
+
+    {
+        let sb = state.borrow();
+        sb.progress_bar.set_visible(false);
+        sb.status_label.set_label("");
+    }
+    if !errors.is_empty() {
+        crate::utils::show_error(
+            if is_move { "Move Failed" } else { "Copy Failed" },
+            &errors.join("\n"),
+        );
+    }
+    refresh_current_archive_and_reload(state).await;
+    not_done
+}
+
+/// Puts the selection on the app clipboard (Copy / Cut).
+pub fn copy_selection(state: &SharedPanel, is_cut: bool) {
+    let paths = get_all_selected_paths(state);
+    if paths.is_empty() {
+        return;
+    }
+    let password = paths
+        .iter()
+        .find_map(|p| crate::archive::browse::parse_archive_path(p).map(|(a, _)| a))
+        .and_then(|a| password_for_archive(state, &a));
+    let count = paths.len();
+    let first_name = paths[0]
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    crate::clipboard::set(crate::clipboard::ClipboardData { paths, is_cut, password });
+    let verb = if is_cut { "cut" } else { "copied" };
+    let msg = if count == 1 {
+        format!("{} {} to clipboard", first_name, verb)
+    } else {
+        format!("{} items {} to clipboard", count, verb)
+    };
+    state.borrow().status_label.set_label(&msg);
+}
+
+/// Pastes the app clipboard into the current folder (on disk or inside an archive).
+pub fn paste_clipboard(state: &SharedPanel, spinner: Option<gtk::Spinner>) {
+    let cb = crate::clipboard::get();
+    if cb.paths.is_empty() {
+        return;
+    }
+    let dest = match current_archive_location(state) {
+        Some((archive, prefix)) => {
+            let password = password_for_archive(state, &archive);
+            TransferDest::Archive { archive, prefix, password }
+        }
+        None => TransferDest::Dir(state.borrow().current_path.clone()),
+    };
+    let s = state.clone();
+    glib::spawn_future_local(async move {
+        if let Some(ref sp) = spinner {
+            sp.set_spinning(true);
+        }
+        let remaining = transfer_items(&s, cb.paths.clone(), cb.password.clone(), cb.is_cut, dest).await;
+        if cb.is_cut {
+            if remaining.is_empty() {
+                crate::clipboard::clear();
+            } else {
+                // Keep what could not be moved so the user can retry.
+                crate::clipboard::set(crate::clipboard::ClipboardData {
+                    paths: remaining,
+                    is_cut: true,
+                    password: cb.password.clone(),
+                });
+            }
+        }
+        if let Some(ref sp) = spinner {
+            sp.set_spinning(false);
+        }
+    });
+}
+
+/// Asks for confirmation and deletes the selection (on disk or inside an archive).
+pub fn delete_selection(state: &SharedPanel, spinner: Option<gtk::Spinner>) {
+    let names = get_selected_names(state);
+    if names.is_empty() {
+        return;
+    }
+    let current = state.borrow().current_path.clone();
+    let archive_info = current_archive_location(state)
+        .map(|(archive, prefix)| {
+            let pw = password_for_archive(state, &archive);
+            (archive, prefix, pw)
+        });
+    let count = names.len();
+    let msg = if count == 1 {
+        format!("Delete \"{}\"?", names[0])
+    } else {
+        format!("Delete {} items?", count)
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading("Confirm Delete")
+        .body(&msg)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    let s = state.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "delete" {
+            return;
+        }
+        let s2 = s.clone();
+        let names = names.clone();
+        let current = current.clone();
+        let archive_info = archive_info.clone();
+        let spinner = spinner.clone();
+        glib::spawn_future_local(async move {
+            if let Some(ref sp) = spinner {
+                sp.set_spinning(true);
+            }
+            let mut errors = Vec::new();
+            if let Some((archive, prefix, pw)) = &archive_info {
+                for name in &names {
+                    let internal = join_internal(prefix, name);
+                    if let Err(e) = crate::archive::creator::delete_entry_from_archive(
+                        archive, &internal, pw.as_deref(),
+                    ).await {
+                        errors.push(format!("{}: {}", name, crate::utils::humanize_error(&e)));
+                    }
+                }
+            } else {
+                for name in &names {
+                    if let Err(e) = crate::operations::delete::delete_entry(&current.join(name)).await {
+                        errors.push(format!("{}: {}", name, e));
+                    }
+                }
+            }
+            if !errors.is_empty() {
+                crate::utils::show_error("Delete Failed", &errors.join("\n"));
+            }
+            refresh_current_archive_and_reload(&s2).await;
+            if let Some(ref sp) = spinner {
+                sp.set_spinning(false);
+            }
+        });
+    });
+    dialog.present(crate::utils::parent_window().as_ref());
+}
+
+/// Asks for a name and creates a folder in the current location
+/// (inside the current archive folder when browsing an archive).
+pub fn new_folder(state: &SharedPanel, spinner: Option<gtk::Spinner>) {
+    let current = state.borrow().current_path.clone();
+    let archive_info = current_archive_location(state)
+        .map(|(archive, prefix)| {
+            let pw = password_for_archive(state, &archive);
+            (archive, prefix, pw)
+        });
+    let dialog = adw::AlertDialog::builder()
+        .heading("New Folder")
+        .body("Enter folder name:")
+        .build();
+    let entry = gtk::Entry::builder()
+        .placeholder_text("New Folder")
+        .hexpand(true)
+        .activates_default(true)
+        .build();
+    entry.set_text("New Folder");
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("create", "Create");
+    dialog.set_default_response(Some("create"));
+
+    let s = state.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "create" {
+            return;
+        }
+        let name = entry.text().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if name.contains('/') || name == "." || name == ".." {
+            crate::utils::show_error("New Folder", &format!("\"{}\" is not a valid folder name.", name));
+            return;
+        }
+        let s2 = s.clone();
+        let current = current.clone();
+        let archive_info = archive_info.clone();
+        let spinner = spinner.clone();
+        glib::spawn_future_local(async move {
+            if let Some(ref sp) = spinner {
+                sp.set_spinning(true);
+            }
+            if let Some((archive, prefix, pw)) = &archive_info {
+                let internal = join_internal(prefix, &name);
+                let exists = s2.borrow().archive_entries.iter()
+                    .any(|e| e.name.trim_matches('/') == internal);
+                if exists {
+                    crate::utils::show_error("New Folder", &format!("\"{}\" already exists.", name));
+                } else if let Err(e) = crate::archive::creator::add_directory_to_archive(
+                    archive, prefix, &name, pw.as_deref(),
+                ).await {
+                    crate::utils::show_error("New Folder", &e);
+                }
+            } else if let Err(e) = crate::operations::mkdir::create_directory(&current.join(&name)).await {
+                crate::utils::show_error("Create Folder Failed", &e);
+            }
+            refresh_current_archive_and_reload(&s2).await;
+            if let Some(ref sp) = spinner {
+                sp.set_spinning(false);
+            }
+        });
+    });
+    dialog.present(crate::utils::parent_window().as_ref());
 }
 
 // --- Context menu handlers ---
@@ -643,122 +1130,18 @@ fn ctx_open_with(state: &SharedPanel) {
 }
 
 fn ctx_copy(state: &SharedPanel) {
-    let paths = get_all_selected_paths(state);
-    if paths.is_empty() {
-        return;
-    }
-    let count = paths.len();
-    let names = get_selected_names(state);
-    crate::clipboard::set(crate::clipboard::ClipboardData {
-        paths,
-        is_cut: false,
-    });
-    let s = state.borrow();
-    let msg = if count == 1 {
-        format!("{} copied to clipboard", names[0])
-    } else {
-        format!("{} items copied to clipboard", count)
-    };
-    s.status_label.set_label(&msg);
+    copy_selection(state, false);
 }
 
 fn ctx_move(state: &SharedPanel) {
-    let paths = get_all_selected_paths(state);
-    if paths.is_empty() {
-        return;
-    }
-    let count = paths.len();
-    let names = get_selected_names(state);
-    crate::clipboard::set(crate::clipboard::ClipboardData {
-        paths,
-        is_cut: true,
-    });
-    let s = state.borrow();
-    let msg = if count == 1 {
-        format!("{} cut to clipboard", names[0])
-    } else {
-        format!("{} items cut to clipboard", count)
-    };
-    s.status_label.set_label(&msg);
+    copy_selection(state, true);
 }
 
 fn ctx_delete(state: &SharedPanel) {
-    let names = get_selected_names(state);
-    if names.is_empty() {
-        return;
-    }
-    let current = { state.borrow().current_path.clone() };
-    let archive_info = crate::archive::browse::parse_archive_path(&current)
-        .map(|(archive_path, _)| {
-            let pw = state.borrow().current_password.clone();
-            (archive_path, pw)
-        });
-    let count = names.len();
-    let msg = if count == 1 {
-        format!("Delete \"{}\"?", names[0])
-    } else {
-        format!("Delete {} items?", count)
-    };
-    let dialog = adw::AlertDialog::builder()
-        .heading("Confirm Delete")
-        .body(&msg)
-        .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("delete", "Delete");
-    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-    let s = state.clone();
-    let current = { state.borrow().current_path.clone() };
-    dialog.connect_response(None, move |_, response| {
-        if response == "delete" {
-            let s2 = s.clone();
-            let c = current.clone();
-            let n = names.clone();
-            if let Some((archive_path, password)) = &archive_info {
-                let ap = archive_path.clone();
-                let pw = password.clone();
-                glib::spawn_future_local(async move {
-                    let vr = { s2.borrow().archive_virtual_root.clone() };
-                    let cur_str = c.to_string_lossy().to_string();
-                    let internal_prefix = cur_str[vr.len()..].trim_start_matches('/').to_string();
-                    for name in &n {
-                        let internal = if internal_prefix.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{}/{}", internal_prefix, name)
-                        };
-                        if let Err(e) = crate::archive::creator::delete_entry_from_archive(
-                            &ap, &internal, pw.as_deref(),
-                        ).await {
-                            crate::utils::show_error("Delete Failed", &e);
-                        }
-                    }
-                    match crate::archive::lister::list_archive_with_password(
-                        &ap, pw.as_deref(),
-                    ).await {
-                        Ok(entries) => {
-                            s2.borrow_mut().archive_entries = entries;
-                        }
-                        Err(_) => {}
-                    }
-                    load_directory(&s2);
-                });
-            } else {
-                glib::spawn_future_local(async move {
-                    for name in &n {
-                        let path = c.join(name);
-                        if let Err(e) = crate::operations::delete::delete_entry(&path).await {
-                            crate::utils::show_error("Delete Failed", &e);
-                        }
-                    }
-                    load_directory(&s2);
-                });
-            }
-        }
-    });
-    dialog.present(crate::utils::parent_window().as_ref());
+    delete_selection(state, None);
 }
 
-fn ctx_rename(state: &SharedPanel) {
+pub fn ctx_rename(state: &SharedPanel) {
     let path = match get_selected_path(state) {
         Some(p) if !p.file_name().map_or(false, |n| n == "..") => p,
         _ => return,
@@ -839,173 +1222,7 @@ fn ctx_rename(state: &SharedPanel) {
 }
 
 fn ctx_paste(state: &SharedPanel) {
-    let cb = crate::clipboard::get();
-    if cb.paths.is_empty() {
-        return;
-    }
-    let current = { state.borrow().current_path.clone() };
-    let pw = { state.borrow().current_password.clone() };
-    let dest_archive_info = crate::archive::browse::parse_archive_path(&current)
-        .map(|(archive_path, internal_prefix)| {
-            let pw = state.borrow().current_password.clone();
-            (archive_path, internal_prefix, pw)
-        });
-    let s = state.clone();
-    let total = cb.paths.len();
-    glib::spawn_future_local(async move {
-        {
-            let sb = s.borrow();
-            sb.progress_bar.set_visible(true);
-            sb.progress_bar.set_fraction(0.0);
-            sb.progress_bar.set_text(Some("0%"));
-            sb.status_label.set_label("Pasting files...");
-        }
-        let mut done = 0usize;
-
-        if let Some((dest_archive, ref internal_prefix, ref dest_pw)) = dest_archive_info {
-            for path in &cb.paths {
-                let name = match path.file_name() {
-                    Some(n) => n.to_string_lossy().to_string(),
-                    None => continue,
-                };
-                {
-                    let pct = ((done as f64 / total as f64) * 100.0) as u32;
-                    let sb = s.borrow();
-                    sb.progress_bar.set_fraction(pct as f64 / 100.0);
-                    sb.progress_bar.set_text(Some(&format!("{}%", pct)));
-                    sb.status_label.set_label(&format!("Pasting file {} of {}...", done + 1, total));
-                }
-
-                if let Some((src_archive, src_internal)) = crate::archive::browse::parse_archive_path(path) {
-                    let tmp = std::env::temp_dir().join("sevenzip-gui-paste");
-                    let _ = std::fs::create_dir_all(&tmp);
-                    let extract_dir = tmp.join(&name);
-                    let _ = std::fs::remove_dir_all(&extract_dir);
-                    if let Err(e) = crate::archive::extractor::extract_entry(
-                        &src_archive, &src_internal, &tmp, dest_pw.as_deref(),
-                    ).await {
-                        crate::utils::show_error("Paste Failed", &e);
-                        done += 1;
-                        continue;
-                    }
-                    let source_path = if src_internal.ends_with('/') || src_internal.contains('/') {
-                        let nested = tmp.join(&name);
-                        if nested.exists() { nested } else { tmp.join(name.rsplit('/').next().unwrap_or(&name)) }
-                    } else {
-                        tmp.join(&name)
-                    };
-                    let refs = vec![source_path.as_path()];
-                    if let Err(e) = crate::archive::creator::add_files_into_archive_path(
-                        &dest_archive, &refs, internal_prefix, dest_pw.as_deref(), None,
-                    ).await {
-                        crate::utils::show_error("Paste Failed", &e);
-                    }
-                    let _ = std::fs::remove_dir_all(&tmp);
-                } else {
-                    let refs = vec![path.as_path()];
-                    if let Err(e) = crate::archive::creator::add_files_into_archive_path(
-                        &dest_archive, &refs, internal_prefix, dest_pw.as_deref(), None,
-                    ).await {
-                        crate::utils::show_error("Paste Failed", &e);
-                    }
-                }
-                done += 1;
-            }
-
-            if cb.is_cut {
-                for path in &cb.paths {
-                    if let Some((src_archive, src_internal)) = crate::archive::browse::parse_archive_path(path) {
-                        if let Err(e) = crate::archive::creator::delete_entry_from_archive(
-                            &src_archive, &src_internal, dest_pw.as_deref(),
-                        ).await {
-                            crate::utils::show_error("Delete Failed", &e);
-                        }
-                    } else {
-                        if path.is_dir() {
-                            let _ = std::fs::remove_dir_all(path);
-                        } else {
-                            let _ = std::fs::remove_file(path);
-                        }
-                    }
-                }
-                crate::clipboard::set(crate::clipboard::ClipboardData {
-                    paths: Vec::new(),
-                    is_cut: false,
-                });
-            }
-
-            match crate::archive::lister::list_archive_with_password(
-                &dest_archive, dest_pw.as_deref(),
-            ).await {
-                Ok(entries) => {
-                    s.borrow_mut().archive_entries = entries;
-                }
-                Err(_) => {}
-            }
-        } else {
-            let mut skip_existing = false;
-            for path in &cb.paths {
-                let name = match path.file_name() {
-                    Some(n) => n.to_string_lossy().to_string(),
-                    None => continue,
-                };
-                let dest = current.join(&name);
-
-                if dest.exists() && !skip_existing {
-                    match confirm_overwrite(&name).await {
-                        0 => {
-                            if dest.is_dir() {
-                                let _ = std::fs::remove_dir_all(&dest);
-                            } else {
-                                let _ = std::fs::remove_file(&dest);
-                            }
-                        }
-                        1 => { done += 1; continue; }
-                        2 => { skip_existing = true; done += 1; continue; }
-                        _ => break,
-                    }
-                }
-
-                {
-                    let pct = ((done as f64 / total as f64) * 100.0) as u32;
-                    let sb = s.borrow();
-                    sb.progress_bar.set_fraction(pct as f64 / 100.0);
-                    sb.progress_bar.set_text(Some(&format!("{}%", pct)));
-                    sb.status_label.set_label(&format!("Pasting file {} of {}...", done + 1, total));
-                }
-
-                if let Err(e) = crate::operations::copy::copy_file(path, &dest, pw.as_deref()).await {
-                    crate::utils::show_error("Paste Failed", &e);
-                }
-                done += 1;
-            }
-            if cb.is_cut {
-                for path in &cb.paths {
-                    if crate::archive::browse::parse_archive_path(path).is_some() {
-                        continue;
-                    }
-                    if path.is_dir() {
-                        if let Err(e) = std::fs::remove_dir_all(path) {
-                            crate::utils::show_error("Delete Failed", &e.to_string());
-                        }
-                    } else if let Err(e) = std::fs::remove_file(path) {
-                        crate::utils::show_error("Delete Failed", &e.to_string());
-                    }
-                }
-                crate::clipboard::set(crate::clipboard::ClipboardData {
-                    paths: Vec::new(),
-                    is_cut: false,
-                });
-            }
-        }
-
-        {
-            let sb = s.borrow();
-            sb.progress_bar.set_visible(false);
-            sb.status_label.set_label("");
-        }
-        load_directory(&s);
-    });
+    paste_clipboard(state, None);
 }
 
 async fn confirm_overwrite(name: &str) -> u8 {
@@ -1042,31 +1259,15 @@ fn ctx_create_archive(state: &SharedPanel) {
 }
 
 fn ctx_add_to_archive(state: &SharedPanel) {
-    let (inside_archive, archive_from_path, internal_prefix) = {
-        let s = state.borrow();
-        if let Some((archive_path, _)) =
-            crate::archive::browse::parse_archive_path(&s.current_path)
-        {
-            let cur = s.current_path.to_string_lossy();
-            let vr = &s.archive_virtual_root;
-            let prefix = if cur.starts_with(vr.as_str()) {
-                cur[vr.len()..]
-                    .trim_start_matches('/')
-                    .trim_end_matches('/')
-                    .to_string()
-            } else {
-                String::new()
-            };
-            (true, Some(archive_path), prefix)
-        } else {
-            (false, None, String::new())
-        }
-    };
+    add_to_archive_dialog(state, None);
+}
 
-    let target_archive = if inside_archive {
-        archive_from_path
-    } else {
-        get_selected_path(state)
+/// "Add to Archive": pick files and add them to the archive being browsed
+/// (into the current folder), or to the selected archive file.
+pub fn add_to_archive_dialog(state: &SharedPanel, spinner: Option<gtk::Spinner>) {
+    let (target_archive, internal_prefix) = match current_archive_location(state) {
+        Some((archive, prefix)) => (Some(archive), prefix),
+        None => (get_selected_path(state), String::new()),
     };
     let target_archive = match target_archive {
         Some(p) if p.is_file() => p,
@@ -1083,7 +1284,7 @@ fn ctx_add_to_archive(state: &SharedPanel) {
 
     let s = state.clone();
     let archive = target_archive.clone();
-    dialog.open_multiple(None::<&gtk::Window>, None::<&gio::Cancellable>, move |result| {
+    dialog.open_multiple(crate::utils::parent_window().as_ref(), None::<&gio::Cancellable>, move |result| {
         if let Ok(files) = result {
             let n = files.n_items();
             let mut file_paths = Vec::new();
@@ -1102,8 +1303,12 @@ fn ctx_add_to_archive(state: &SharedPanel) {
             let s2 = s.clone();
             let archive2 = archive.clone();
             let prefix = internal_prefix.clone();
-            let pw = { s2.borrow().current_password.clone() };
+            let pw = password_for_archive(&s2, &archive2);
+            let spinner = spinner.clone();
             glib::spawn_future_local(async move {
+                if let Some(ref sp) = spinner {
+                    sp.set_spinning(true);
+                }
                 {
                     let sb = s2.borrow();
                     sb.status_label.set_label("Adding files to archive...");
@@ -1117,27 +1322,14 @@ fn ctx_add_to_archive(state: &SharedPanel) {
                 {
                     let sb = s2.borrow();
                     sb.progress_bar.set_visible(false);
+                    sb.status_label.set_label("");
                 }
-                match result {
-                    Ok(_) => {
-                        let pw2 = pw.clone();
-                        let archive3 = archive2.clone();
-                        let s3 = s2.clone();
-                        glib::spawn_future_local(async move {
-                            match crate::archive::lister::list_archive_with_password(
-                                &archive3, pw2.as_deref(),
-                            ).await {
-                                Ok(entries) => {
-                                    s3.borrow_mut().archive_entries = entries;
-                                }
-                                Err(_) => {}
-                            }
-                            load_directory(&s3);
-                        });
-                    }
-                    Err(e) => {
-                        crate::utils::show_error("Add to Archive Failed", &e);
-                    }
+                if let Err(e) = result {
+                    crate::utils::show_error("Add to Archive Failed", &e);
+                }
+                refresh_current_archive_and_reload(&s2).await;
+                if let Some(ref sp) = spinner {
+                    sp.set_spinning(false);
                 }
             });
         }
@@ -1145,172 +1337,92 @@ fn ctx_add_to_archive(state: &SharedPanel) {
 }
 
 fn ctx_extract_here(state: &SharedPanel) {
-    let password = state.borrow().current_password.clone();
     let paths = get_all_selected_paths(state);
     if paths.is_empty() {
         return;
     }
     let s = state.clone();
-    let archive_name = {
-        let first = &paths[0];
-        if let Some((archive_path, _)) = crate::archive::browse::parse_archive_path(first) {
-            archive_path.file_name().unwrap_or_default().to_string_lossy().to_string()
-        } else {
-            first.file_name().unwrap_or_default().to_string_lossy().to_string()
-        }
-    };
     glib::spawn_future_local(async move {
-        let mut entries_to_extract: Vec<(PathBuf, String)> = Vec::new();
-        let mut top_level_archives: Vec<PathBuf> = Vec::new();
-        for p in &paths {
-            if let Some((archive_path, internal)) = crate::archive::browse::parse_archive_path(p) {
-                entries_to_extract.push((archive_path, internal));
-            } else if p.is_file() {
-                top_level_archives.push(p.clone());
-            }
-        }
-        for (archive, internal) in &entries_to_extract {
-            let output_dir = archive.parent().unwrap_or(archive).to_path_buf();
-            let mut result = crate::archive::extractor::extract_entry(
-                archive, internal, &output_dir, password.as_deref(),
-            ).await;
-            if let Err(ref e) = result {
-                if e == "__NEED_PASSWORD__" {
-                    if let Some(pw) = crate::archive::browse::prompt_for_password(&archive_name).await {
-                        result = crate::archive::extractor::extract_entry(
-                            archive, internal, &output_dir, Some(&pw),
-                        ).await;
-                    }
-                }
-            }
-            if let Err(e) = result {
-                crate::utils::show_error("Extract Failed", &e);
-            }
-        }
-        for archive in &top_level_archives {
-            let output_dir = s.borrow().current_path.clone();
-            let options = crate::archive::extractor::ExtractOptions {
-                output_dir: output_dir.clone(),
-                full_paths: true,
-                overwrite: crate::archive::extractor::OverwriteMode::Overwrite,
-                password: password.clone(),
-            };
-            let mut result = crate::archive::extractor::extract_archive(
-                archive, &options, None, None, None,
-            ).await;
-            if let Err(ref e) = result {
-                if e == "__NEED_PASSWORD__" {
-                    if let Some(pw) = crate::archive::browse::prompt_for_password(&archive_name).await {
-                        let options = crate::archive::extractor::ExtractOptions {
-                            output_dir,
-                            full_paths: true,
-                            overwrite: crate::archive::extractor::OverwriteMode::Overwrite,
-                            password: Some(pw),
-                        };
-                        result = crate::archive::extractor::extract_archive(
-                            archive, &options, None, None, None,
-                        ).await;
-                    }
-                }
-            }
-            if let Err(e) = result {
-                crate::utils::show_error("Extract Failed", &e);
-            }
-        }
-        load_directory(&s);
+        extract_paths(&s, &paths, None).await;
     });
 }
 
 fn ctx_extract_to(state: &SharedPanel) {
-    let password = state.borrow().current_password.clone();
     let paths = get_all_selected_paths(state);
     if paths.is_empty() {
         return;
     }
-    let mut entries_to_extract: Vec<(PathBuf, String)> = Vec::new();
-    let mut top_level_archives: Vec<PathBuf> = Vec::new();
-    for p in &paths {
-        if let Some((archive_path, internal)) = crate::archive::browse::parse_archive_path(p) {
-            entries_to_extract.push((archive_path, internal));
-        } else if p.is_file() {
-            top_level_archives.push(p.clone());
-        }
-    }
     let s = state.clone();
-    let archive_name = if let Some((ref a, _)) = entries_to_extract.first() {
-        a.file_name().unwrap_or_default().to_string_lossy().to_string()
-    } else if let Some(first) = top_level_archives.first() {
-        first.file_name().unwrap_or_default().to_string_lossy().to_string()
-    } else {
-        return;
-    };
     glib::idle_add_local_once(move || {
         let dialog = gtk::FileDialog::builder()
             .title("Extract To...")
             .accept_label("Extract")
             .build();
-        dialog.select_folder(None::<&gtk::Window>, None::<&gio::Cancellable>, move |result| {
+        dialog.select_folder(crate::utils::parent_window().as_ref(), None::<&gio::Cancellable>, move |result| {
             if let Ok(dest_dir) = result {
                 if let Some(dest_path) = dest_dir.path() {
                     let s2 = s.clone();
-                    let archive_name = archive_name.clone();
-                    let output = dest_path.to_path_buf();
-                    let pw = password.clone();
-                    let entries = entries_to_extract.clone();
-                    let archives = top_level_archives.clone();
+                    let paths = paths.clone();
                     glib::spawn_future_local(async move {
-                        for (archive, internal) in &entries {
-                            let mut result = crate::archive::extractor::extract_entry(
-                                archive, internal, &output, pw.as_deref(),
-                            ).await;
-                            if let Err(ref e) = result {
-                                if e == "__NEED_PASSWORD__" {
-                                    if let Some(pw) = crate::archive::browse::prompt_for_password(&archive_name).await {
-                                        result = crate::archive::extractor::extract_entry(
-                                            archive, internal, &output, Some(&pw),
-                                        ).await;
-                                    }
-                                }
-                            }
-                            if let Err(e) = result {
-                                crate::utils::show_error("Extract Failed", &e);
-                            }
-                        }
-                        for archive in &archives {
-                            let options = crate::archive::extractor::ExtractOptions {
-                                output_dir: output.clone(),
-                                full_paths: true,
-                                overwrite: crate::archive::extractor::OverwriteMode::Overwrite,
-                                password: pw.clone(),
-                            };
-                            let mut result = crate::archive::extractor::extract_archive(
-                                archive, &options, None, None, None,
-                            ).await;
-                            if let Err(ref e) = result {
-                                if e == "__NEED_PASSWORD__" {
-                                    if let Some(pw) = crate::archive::browse::prompt_for_password(&archive_name).await {
-                                        let options = crate::archive::extractor::ExtractOptions {
-                                            output_dir: output.clone(),
-                                            full_paths: true,
-                                            overwrite: crate::archive::extractor::OverwriteMode::Overwrite,
-                                            password: Some(pw),
-                                        };
-                                        result = crate::archive::extractor::extract_archive(
-                                            archive, &options, None, None, None,
-                                        ).await;
-                                    }
-                                }
-                            }
-                            if let Err(e) = result {
-                                crate::utils::show_error("Extract Failed", &e);
-                            }
-                        }
-                        load_directory(&s2);
+                        extract_paths(&s2, &paths, Some(dest_path)).await;
                     });
                 }
             }
         });
     });
+}
+
+/// Extracts the given items. Entries inside an archive are extracted (folders with their
+/// contents) next to the archive, archive files on disk into the current folder —
+/// or everything into `output` when given. Each archive uses its own password.
+async fn extract_paths(state: &SharedPanel, paths: &[PathBuf], output: Option<PathBuf>) {
+    let mut errors = Vec::new();
+    for p in paths {
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if let Some((archive, internal)) = crate::archive::browse::parse_archive_path(p) {
+            if internal.trim_matches('/').is_empty() {
+                continue;
+            }
+            let out_dir = output.clone().unwrap_or_else(|| {
+                archive.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+            });
+            let mut pw = password_for_archive(state, &archive);
+            if let Err(e) = extract_entry_with_prompt(state, &archive, &internal, &out_dir, &mut pw).await {
+                errors.push(format!("{}: {}", name, crate::utils::humanize_error(&e)));
+            }
+        } else if p.is_file() {
+            let out_dir = output.clone().unwrap_or_else(|| state.borrow().current_path.clone());
+            let mut pw = password_for_archive(state, p);
+            loop {
+                let options = crate::archive::extractor::ExtractOptions {
+                    output_dir: out_dir.clone(),
+                    full_paths: true,
+                    overwrite: crate::archive::extractor::OverwriteMode::Overwrite,
+                    password: pw.clone(),
+                };
+                match crate::archive::extractor::extract_archive(p, &options, None, None, None).await {
+                    Ok(_) => break,
+                    Err(e) if e == crate::utils::NEED_PASSWORD => {
+                        match crate::archive::browse::prompt_for_password_retry(&name, pw.is_some()).await {
+                            Some(new_pw) => {
+                                remember_password(state, p, &new_pw);
+                                pw = Some(new_pw);
+                            }
+                            None => break,
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {}", name, crate::utils::humanize_error(&e)));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        crate::utils::show_error("Extract Failed", &errors.join("\n"));
+    }
+    load_directory(state);
 }
 
 fn ctx_test_archive(state: &SharedPanel) {
@@ -1335,68 +1447,7 @@ fn ctx_test_archive(state: &SharedPanel) {
     }
 
 fn ctx_new_folder(state: &SharedPanel) {
-    let (current, archive_info) = {
-        let s = state.borrow();
-        let cur = s.current_path.clone();
-        let archive = crate::archive::browse::parse_archive_path(&cur)
-            .map(|(p, _)| (p, s.current_password.clone()));
-        (cur, archive)
-    };
-    let dialog = adw::AlertDialog::builder()
-        .heading("New Folder")
-        .body("Enter folder name:")
-        .build();
-    let entry = gtk::Entry::builder()
-        .placeholder_text("New Folder")
-        .hexpand(true)
-        .build();
-    entry.set_text("New Folder");
-    dialog.set_extra_child(Some(&entry));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("create", "Create");
-
-    let s = state.clone();
-    let current2 = current.clone();
-    let archive_info2 = archive_info.clone();
-    dialog.connect_response(None, move |_, response| {
-        if response == "create" {
-            let name = entry.text().to_string();
-            if !name.is_empty() {
-                if let Some((archive_path, password)) = &archive_info2 {
-                    let s2 = s.clone();
-                    let ap = archive_path.clone();
-                    let pw = password.clone();
-                    let n = name.clone();
-                    glib::spawn_future_local(async move {
-                        if let Err(e) = crate::archive::creator::add_directory_to_archive(
-                            &ap, &n, pw.as_deref(),
-                        ).await {
-                            crate::utils::show_error("New Folder", &e);
-                        }
-                        match crate::archive::lister::list_archive_with_password(
-                            &ap, pw.as_deref(),
-                        ).await {
-                            Ok(entries) => {
-                                s2.borrow_mut().archive_entries = entries;
-                            }
-                            Err(_) => {}
-                        }
-                        load_directory(&s2);
-                    });
-                } else {
-                    let path = current2.join(&name);
-                    let s2 = s.clone();
-                    glib::spawn_future_local(async move {
-                        if let Err(e) = crate::operations::mkdir::create_directory(&path).await {
-                            crate::utils::show_error("Create Folder Failed", &e);
-                        }
-                        load_directory(&s2);
-                    });
-                }
-            }
-        }
-    });
-    dialog.present(crate::utils::parent_window().as_ref());
+    new_folder(state, None);
 }
 
 fn ctx_add_bookmark(state: &SharedPanel) {
@@ -1495,7 +1546,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
     let panel_state = state.clone();
     name_factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let icon = gtk::Image::new();
         icon.set_pixel_size(16);
         let label = gtk::Label::builder()
@@ -1525,7 +1576,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
                 if let Some(item) = s.sort_model.item(pos) {
                     if let Ok(fi) = item.downcast::<FileItem>() {
                         let p = fi.path();
-                        if !p.is_empty() {
+                        if !p.is_empty() && !is_parent_row(&fi) {
                             drag_paths.push(p);
                         }
                     }
@@ -1536,7 +1587,11 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
             let cursor_path = ds.widget()
                 .as_ref()
                 .and_then(|w| widget_item_data(w))
-                .map(|(path, _)| path);
+                .map(|(path, _)| path)
+                .filter(|path| {
+                    // The ".." row stores the parent folder (or ".." in archives); never drag it.
+                    path != ".." && Some(Path::new(path)) != s.current_path.parent()
+                });
             if let Some(ref path_ref) = cursor_path {
                 if !path_ref.is_empty() && !drag_paths.contains(path_ref) {
                     drag_paths.clear();
@@ -1594,15 +1649,14 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
         let _ps_for_item_accept = panel_state.clone();
         drop_target_on_item.connect_accept(move |_, _drop| true);
         drop_target_on_item.connect_drop(move |ds, value, _x, _y| {
-            let (in_archive, archive_path, archive_pw) = {
-                let s = ps_for_item_drop.borrow();
-                let in_arc = crate::archive::browse::parse_archive_path(&s.current_path).is_some();
-                let arc = crate::archive::browse::parse_archive_path(&s.current_path)
-                    .map(|(p, _)| p)
-                    .unwrap_or(s.current_path.clone());
-                let pw = s.current_password.clone();
-                (in_arc, arc, pw)
-            };
+            let (in_archive, archive_path, archive_pw) =
+                match current_archive_location(&ps_for_item_drop) {
+                    Some((arc, _)) => {
+                        let pw = password_for_archive(&ps_for_item_drop, &arc);
+                        (true, arc, pw)
+                    }
+                    None => (false, ps_for_item_drop.borrow().current_path.clone(), None),
+                };
 
             let widget = match ds.widget() {
                 Some(w) => w,
@@ -1655,15 +1709,9 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
                         let item_vpath = widget_item_data(&widget)
                             .map(|(p, _)| p)
                             .unwrap_or_default();
-                        let virtual_root = {
-                            let s = s3.borrow();
-                            s.archive_virtual_root.clone()
-                        };
-                        if item_vpath.starts_with(&virtual_root) {
-                            item_vpath[virtual_root.len()..].trim_start_matches('/').to_string()
-                        } else {
-                            String::new()
-                        }
+                        crate::archive::browse::parse_archive_path(Path::new(&item_vpath))
+                            .map(|(_, internal)| internal.trim_matches('/').to_string())
+                            .unwrap_or_default()
                     } else {
                         String::new()
                     };
@@ -1730,34 +1778,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
                     }
                     crate::panels::load_directory(&s3);
                 } else {
-                    let mut skip_existing = false;
-                    for path in &paths {
-                        if let Some(name) = path.file_name() {
-                            let dest = target_path.join(name);
-                            if dest.exists() && !skip_existing {
-                                match confirm_overwrite(&name.to_string_lossy()).await {
-                                    0 => {
-                                        if dest.is_dir() {
-                                            let _ = std::fs::remove_dir_all(&dest);
-                                        } else {
-                                            let _ = std::fs::remove_file(&dest);
-                                        }
-                                    }
-                                    1 => continue,
-                                    2 => { skip_existing = true; continue; }
-                                    _ => break,
-                                }
-                            }
-                            if is_move {
-                                if let Err(e) = crate::operations::move_move::move_file(path, &dest, None).await {
-                                    crate::utils::show_error("Drop Failed", &e);
-                                }
-                            } else if let Err(e) = crate::operations::copy::copy_file(path, &dest, None).await {
-                                crate::utils::show_error("Drop Failed", &e);
-                            }
-                        }
-                    }
-                    crate::panels::load_directory(&s3);
+                    transfer_items(&s3, paths, None, is_move, TransferDest::Dir(target_path)).await;
                 }
             });
             true
@@ -1770,17 +1791,20 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
         let hbox = item.child().and_downcast::<gtk::Box>().unwrap();
         let icon = hbox.first_child().and_downcast::<gtk::Image>().unwrap();
         let label = hbox.last_child().and_downcast::<gtk::Label>().unwrap();
-        let icon_name = icon_for_file(&file_item.name(), file_item.is_dir());
-        icon.set_icon_name(Some(icon_name));
-        label.set_label(&file_item.name());
+        let name = file_item.name();
+        if name == ".." {
+            icon.set_icon_name(Some("go-up-symbolic"));
+            label.set_tooltip_text(Some("Parent folder"));
+            label.add_css_class("dim-label");
+        } else {
+            icon.set_from_gicon(&item_icon(&name, file_item.is_dir()));
+            label.set_tooltip_text(None);
+            label.remove_css_class("dim-label");
+        }
+        label.set_label(&name);
         unsafe {
             hbox.set_data("item-path", file_item.path());
             hbox.set_data("item-is-dir", file_item.is_dir());
-        }
-        if file_item.is_dir() {
-            label.add_css_class("accent");
-        } else {
-            label.remove_css_class("accent");
         }
     });
     let name_sorter = gtk::CustomSorter::new(|a, b| {
@@ -1789,7 +1813,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
         a.name().to_lowercase().cmp(&b.name().to_lowercase()).into()
     });
     let name_col = gtk::ColumnViewColumn::new(Some("Name"), Some(name_factory));
-    name_col.set_fixed_width(300);
+    name_col.set_expand(true);
     name_col.set_resizable(true);
     name_col.set_sorter(Some(&name_sorter));
     column_view.append_column(&name_col);
@@ -1798,7 +1822,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
     let size_factory = gtk::SignalListItemFactory::new();
     size_factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let label = gtk::Label::builder().xalign(1.0).build();
+        let label = gtk::Label::builder().xalign(1.0).css_classes(["numeric", "dim-label"]).build();
         item.set_child(Some(&label));
     });
     size_factory.connect_bind(move |_, item| {
@@ -1817,7 +1841,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
         a.size().cmp(&b.size()).into()
     });
     let size_col = gtk::ColumnViewColumn::new(Some("Size"), Some(size_factory));
-    size_col.set_fixed_width(100);
+    size_col.set_fixed_width(96);
     size_col.set_resizable(true);
     size_col.set_sorter(Some(&size_sorter));
     column_view.append_column(&size_col);
@@ -1826,7 +1850,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
     let date_factory = gtk::SignalListItemFactory::new();
     date_factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let label = gtk::Label::builder().xalign(0.0).build();
+        let label = gtk::Label::builder().xalign(0.0).css_classes(["numeric", "dim-label"]).build();
         item.set_child(Some(&label));
     });
     date_factory.connect_bind(move |_, item| {
@@ -1841,7 +1865,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
         a.modified().cmp(&b.modified()).into()
     });
     let date_col = gtk::ColumnViewColumn::new(Some("Modified"), Some(date_factory));
-    date_col.set_fixed_width(160);
+    date_col.set_fixed_width(150);
     date_col.set_resizable(true);
     date_col.set_sorter(Some(&date_sorter));
     column_view.append_column(&date_col);
@@ -1850,7 +1874,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
     let created_factory = gtk::SignalListItemFactory::new();
     created_factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let label = gtk::Label::builder().xalign(0.0).build();
+        let label = gtk::Label::builder().xalign(0.0).css_classes(["numeric", "dim-label"]).build();
         item.set_child(Some(&label));
     });
     created_factory.connect_bind(move |_, item| {
@@ -1865,7 +1889,8 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
         a.created().cmp(&b.created()).into()
     });
     let created_col = gtk::ColumnViewColumn::new(Some("Created"), Some(created_factory));
-    created_col.set_fixed_width(160);
+    created_col.set_fixed_width(150);
+    created_col.set_visible(false);
     created_col.set_resizable(true);
     created_col.set_sorter(Some(&created_sorter));
     column_view.append_column(&created_col);
@@ -1874,7 +1899,7 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
     let accessed_factory = gtk::SignalListItemFactory::new();
     accessed_factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let label = gtk::Label::builder().xalign(0.0).build();
+        let label = gtk::Label::builder().xalign(0.0).css_classes(["numeric", "dim-label"]).build();
         item.set_child(Some(&label));
     });
     accessed_factory.connect_bind(move |_, item| {
@@ -1889,7 +1914,8 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
         a.accessed().cmp(&b.accessed()).into()
     });
     let accessed_col = gtk::ColumnViewColumn::new(Some("Accessed"), Some(accessed_factory));
-    accessed_col.set_fixed_width(160);
+    accessed_col.set_fixed_width(150);
+    accessed_col.set_visible(false);
     accessed_col.set_resizable(true);
     accessed_col.set_sorter(Some(&accessed_sorter));
     column_view.append_column(&accessed_col);
@@ -1898,14 +1924,20 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
     let type_factory = gtk::SignalListItemFactory::new();
     type_factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let label = gtk::Label::builder().xalign(0.0).build();
+        let label = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label"])
+            .build();
         item.set_child(Some(&label));
     });
     type_factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
         let file_item = item.item().and_downcast::<FileItem>().unwrap();
         let label = item.child().and_downcast::<gtk::Label>().unwrap();
-        label.set_label(&file_item.file_type());
+        let file_type = file_item.file_type();
+        label.set_tooltip_text(if file_type.is_empty() { None } else { Some(file_type.as_str()) });
+        label.set_label(&file_type);
     });
     let type_sorter = gtk::CustomSorter::new(|a, b| {
         let a = a.downcast_ref::<FileItem>().unwrap();
@@ -1913,10 +1945,35 @@ fn setup_columns(column_view: &gtk::ColumnView, state: &crate::panels::SharedPan
         a.file_type().to_lowercase().cmp(&b.file_type().to_lowercase()).into()
     });
     let type_col = gtk::ColumnViewColumn::new(Some("Type"), Some(type_factory));
-    type_col.set_fixed_width(100);
+    type_col.set_fixed_width(180);
     type_col.set_resizable(true);
     type_col.set_sorter(Some(&type_sorter));
     column_view.append_column(&type_col);
+
+    // Right-click any column header to show or hide the optional columns.
+    let cols = gio::SimpleActionGroup::new();
+    let header_menu = gio::Menu::new();
+    for (key, label, col) in [
+        ("modified", "Modified", &date_col),
+        ("created", "Created", &created_col),
+        ("accessed", "Accessed", &accessed_col),
+        ("type", "Type", &type_col),
+        ("size", "Size", &size_col),
+    ] {
+        let action = gio::SimpleAction::new_stateful(key, None, &col.is_visible().to_variant());
+        let c = col.clone();
+        action.connect_activate(move |a, _| {
+            let visible = !c.is_visible();
+            c.set_visible(visible);
+            a.set_state(&visible.to_variant());
+        });
+        cols.add_action(&action);
+        header_menu.append(Some(label), Some(&format!("cols.{}", key)));
+    }
+    column_view.insert_action_group("cols", Some(&cols));
+    for col in [&name_col, &size_col, &date_col, &created_col, &accessed_col, &type_col] {
+        col.set_header_menu(Some(&header_menu));
+    }
 }
 
 // --- Navigation ---
@@ -1934,7 +1991,7 @@ pub fn navigate_to(state: &SharedPanel, path: &Path) {
     load_directory(state);
 }
 
-fn go_back(state: &SharedPanel) {
+pub fn go_back(state: &SharedPanel) {
     let can_go = { state.borrow().history_index > 0 };
     if can_go {
         {
@@ -1946,7 +2003,7 @@ fn go_back(state: &SharedPanel) {
     }
 }
 
-fn go_forward(state: &SharedPanel) {
+pub fn go_forward(state: &SharedPanel) {
     let can_go = {
         let s = state.borrow();
         s.history_index < s.history.len() - 1
@@ -1961,7 +2018,7 @@ fn go_forward(state: &SharedPanel) {
     }
 }
 
-fn go_up(state: &SharedPanel) {
+pub fn go_up(state: &SharedPanel) {
     let parent = {
         let s = state.borrow();
         s.current_path.parent().map(|p| p.to_path_buf())
@@ -2045,7 +2102,7 @@ fn open_archive_inside_archive(state: &SharedPanel, archive: &Path, internal: &s
                 Err(e) if e == "__NEED_PASSWORD__" => {
                     match crate::archive::browse::prompt_for_password(&archive_name).await {
                         Some(password) => {
-                            s.borrow_mut().current_password = Some(password.clone());
+                            remember_password(&s, &archive, &password);
                             stored_password = Some(password);
                         }
                         None => return,
@@ -2102,7 +2159,7 @@ fn open_archive_entry(state: &SharedPanel, archive: &Path, internal: &str) {
                     eprintln!("[OPEN] extract_entry needs password");
                     match crate::archive::browse::prompt_for_password(&archive_name).await {
                         Some(password) => {
-                            s.borrow_mut().current_password = Some(password.clone());
+                            remember_password(&s, &archive, &password);
                             stored_password = Some(password);
                         }
                         None => return,
@@ -2141,8 +2198,29 @@ pub fn load_directory(state: &SharedPanel) {
     let s = state.borrow();
     let current_path = s.current_path.clone();
 
-    if crate::archive::browse::parse_archive_path(&current_path).is_some() {
+    if let Some((current_archive, internal_prefix)) =
+        crate::archive::browse::parse_archive_path(&current_path)
+    {
         let virtual_root = s.archive_virtual_root.clone();
+        let busy = s.pulse_source.is_some();
+        drop(s);
+
+        // The loaded entries may belong to a different archive (e.g. after Back/Forward
+        // from archive B into archive A). Re-read the right archive instead of showing
+        // the wrong contents.
+        let loaded = if virtual_root.is_empty() {
+            None
+        } else {
+            crate::archive::browse::parse_archive_path(Path::new(&virtual_root)).map(|(a, _)| a)
+        };
+        if loaded.as_deref() != Some(current_archive.as_path()) {
+            if !busy {
+                crate::archive::browse::reopen_archive(state, &current_archive);
+            }
+            return;
+        }
+
+        let s = state.borrow();
         let archive_entries = s.archive_entries.clone();
         let show_hidden = s.show_hidden.get();
         let raw_store = s.raw_store.clone();
@@ -2150,16 +2228,11 @@ pub fn load_directory(state: &SharedPanel) {
         let status_label = s.status_label.clone();
         drop(s);
 
-        let internal_prefix = current_path.to_string_lossy()
-            [virtual_root.len()..]
-            .trim_start_matches('/')
-            .trim_end_matches('/')
-            .to_string();
+        let internal_prefix = internal_prefix.trim_matches('/').to_string();
 
-        raw_store.remove_all();
-
-        let parent_item = FileItem::new("..", "..", true, 0, 0, 0, 0, "Directory");
-        raw_store.append(&parent_item);
+        // Build the whole list first and insert it in one go: one change notification
+        // instead of one per file keeps big folders fast.
+        let mut items: Vec<FileItem> = vec![FileItem::new("..", "..", true, 0, 0, 0, 0, "")];
 
         let mut count = 0usize;
         for entry in &archive_entries {
@@ -2188,42 +2261,30 @@ pub fn load_directory(state: &SharedPanel) {
             }
 
             let full_virtual = format!("{}/{}", virtual_root, entry.name);
-            let file_type = if entry.is_dir {
-                String::from("Directory")
-            } else {
-                display_name
-                    .rsplit('.')
-                    .next()
-                    .map(|e| format!(".{}", e))
-                    .unwrap_or_default()
-            };
+            let file_type = type_description(&display_name, entry.is_dir);
             let item = FileItem::new(
                 &display_name,
                 &full_virtual,
                 entry.is_dir,
                 entry.size,
-                0,
+                entry.modified,
                 0,
                 0,
                 &file_type,
             );
-            raw_store.append(&item);
+            items.push(item);
             count += 1;
         }
+        raw_store.splice(0, raw_store.n_items(), &items);
 
-        path_entry.set_text(&format!("{}:{}/", current_path
-            .to_string_lossy()
-            .split(" [archive]")
-            .next()
-            .unwrap_or(""), internal_prefix));
-        status_label.set_label(&format!("{} items (in archive)", count));
+        let _ = (path_entry, status_label, count);
+        update_location_ui(state);
+        update_status(state);
         return;
     }
 
     let raw_store = s.raw_store.clone();
     let show_hidden = s.show_hidden.get();
-
-    raw_store.remove_all();
 
     let mut entries: Vec<FileItem> = Vec::new();
 
@@ -2236,7 +2297,7 @@ pub fn load_directory(state: &SharedPanel) {
             0,
             0,
             0,
-            "Directory",
+            "",
         ));
     }
 
@@ -2265,14 +2326,7 @@ pub fn load_directory(state: &SharedPanel) {
                 .and_then(|m| m.accessed().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs());
-            let file_type = if is_dir {
-                String::from("Directory")
-            } else {
-                name.rsplit('.')
-                    .next()
-                    .map(|e| format!(".{}", e))
-                    .unwrap_or_default()
-            };
+            let file_type = type_description(&name, is_dir);
 
             entries.push(FileItem::new(
                 &name,
@@ -2287,14 +2341,178 @@ pub fn load_directory(state: &SharedPanel) {
         }
     }
 
-    for item in &entries {
-        raw_store.append(item);
+    raw_store.splice(0, raw_store.n_items(), &entries);
+
+    drop(s);
+    update_location_ui(state);
+    update_status(state);
+}
+
+/// "~/Documents" for paths under the home folder; the full path otherwise.
+pub fn display_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if path == home {
+            return "~".to_string();
+        }
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return format!("~/{}", rest.display());
+        }
     }
+    path.display().to_string()
+}
 
-    let count = entries.iter().filter(|e| e.name() != "..").count();
+/// Inverse of `display_path`: expands a leading "~".
+fn expand_home(text: &str) -> PathBuf {
+    if text == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(text));
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(text)
+}
 
-    s.path_entry.set_text(&current_path.to_string_lossy());
-    s.status_label.set_label(&format!("{} items", count));
+/// Full-colour themed icon for a file name, like a file manager shows.
+fn item_icon(name: &str, is_dir: bool) -> gio::Icon {
+    if is_dir {
+        return gio::ThemedIcon::from_names(&["folder", "folder-symbolic"]).upcast();
+    }
+    let (content_type, _) = gio::content_type_guess(Some(name), None::<&[u8]>);
+    gio::content_type_get_icon(&content_type)
+}
+
+/// Human-readable type ("Zip archive", "PDF document") instead of a bare extension.
+pub fn type_description(name: &str, is_dir: bool) -> String {
+    if is_dir {
+        return "Folder".to_string();
+    }
+    let (content_type, uncertain) = gio::content_type_guess(Some(name), None::<&[u8]>);
+    if uncertain || gio::content_type_is_unknown(&content_type) {
+        return match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => format!("{} file", ext.to_uppercase()),
+            _ => "File".to_string(),
+        };
+    }
+    gio::content_type_get_description(&content_type).to_string()
+}
+
+/// Updates the header title, path bar text/icon and the "inside an archive" styling.
+fn update_location_ui(state: &SharedPanel) {
+    let s = state.borrow();
+    let path_entry = s.path_entry.clone();
+    if let Some((archive, internal)) = crate::archive::browse::parse_archive_path(&s.current_path) {
+        let internal = internal.trim_matches('/').to_string();
+        let archive_name = archive
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let encrypted = s.current_password.is_some();
+        path_entry.set_text(&if internal.is_empty() {
+            format!("{}/", display_path(&archive))
+        } else {
+            format!("{}/{}/", display_path(&archive), internal)
+        });
+        path_entry.add_css_class("in-archive");
+        path_entry.set_primary_icon_name(Some("package-x-generic-symbolic"));
+        path_entry.set_primary_icon_tooltip_text(Some("Browsing inside an archive"));
+        if encrypted {
+            path_entry.set_secondary_icon_name(Some("changes-prevent-symbolic"));
+            path_entry.set_secondary_icon_tooltip_text(Some("Password-protected archive"));
+        } else {
+            path_entry.set_secondary_icon_name(None);
+        }
+        if let Some(t) = &s.window_title {
+            let title = if internal.is_empty() {
+                archive_name.clone()
+            } else {
+                internal.rsplit('/').next().unwrap_or(&internal).to_string()
+            };
+            t.set_title(&title);
+            t.set_subtitle(&if internal.is_empty() {
+                display_path(archive.parent().unwrap_or(Path::new("/")))
+            } else {
+                format!("in {}", archive_name)
+            });
+        }
+    } else {
+        path_entry.set_text(&display_path(&s.current_path));
+        path_entry.remove_css_class("in-archive");
+        path_entry.set_primary_icon_name(Some("folder-symbolic"));
+        path_entry.set_primary_icon_tooltip_text(None);
+        path_entry.set_secondary_icon_name(None);
+        if let Some(t) = &s.window_title {
+            let title = match s.current_path.file_name() {
+                Some(n) if s.current_path.as_path() != dirs::home_dir().unwrap_or_default().as_path() => {
+                    n.to_string_lossy().to_string()
+                }
+                Some(_) => "Home".to_string(),
+                None => "/".to_string(),
+            };
+            t.set_title(&title);
+            t.set_subtitle(&s.current_path.parent().map(display_path).unwrap_or_default());
+        }
+    }
+}
+
+/// Status line: item count, or how many are selected and their total size.
+/// Also shows/hides the empty-folder message.
+pub fn update_status(state: &SharedPanel) {
+    let s = state.borrow();
+    if s.progress_bar.is_visible() {
+        return; // an operation is reporting progress
+    }
+    let n = s.sort_model.n_items();
+    let mut items = 0u32;
+    let mut selected = 0u32;
+    let mut selected_bytes = 0u64;
+    let mut selected_dirs = false;
+    let selection = s.selection_model.selection();
+    for pos in 0..n {
+        if let Some(fi) = s.sort_model.item(pos).and_downcast::<FileItem>() {
+            if fi.name() == ".." {
+                continue;
+            }
+            items += 1;
+            if selection.contains(pos) {
+                selected += 1;
+                if fi.is_dir() {
+                    selected_dirs = true;
+                } else {
+                    selected_bytes += fi.size();
+                }
+            }
+        }
+    }
+    let noun = |n: u32| if n == 1 { "item" } else { "items" };
+    let text = if selected > 0 {
+        let size = if selected_bytes > 0 || !selected_dirs {
+            format!(" ({})", crate::utils::format::format_size(selected_bytes))
+        } else {
+            String::new()
+        };
+        format!("{} of {} {} selected{}", selected, items, noun(items), size)
+    } else {
+        format!("{} {}", items, noun(items))
+    };
+    s.status_label.set_label(&text);
+
+    let filtering = !s.search_pattern.borrow().is_empty();
+    s.empty_page.set_visible(items == 0 && s.pulse_source.is_none());
+    if filtering {
+        s.empty_page.set_icon_name(Some("edit-find-symbolic"));
+        s.empty_page.set_title("No matching files");
+        s.empty_page.set_description(Some(&format!("Nothing here matches \u{201c}{}\u{201d}", s.search_pattern.borrow())));
+    } else if crate::archive::browse::parse_archive_path(&s.current_path).is_some() {
+        s.empty_page.set_icon_name(Some("package-x-generic-symbolic"));
+        s.empty_page.set_title("This folder is empty");
+        s.empty_page.set_description(Some("Drop files here to add them to the archive"));
+    } else {
+        s.empty_page.set_icon_name(Some("folder-symbolic"));
+        s.empty_page.set_title("This folder is empty");
+        s.empty_page.set_description(None);
+    }
 }
 
 fn extract_to_temp(archive: &Path, internal: &str, password: Option<&str>) -> Option<PathBuf> {

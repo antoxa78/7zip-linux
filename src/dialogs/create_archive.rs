@@ -5,32 +5,67 @@ use gtk::gio;
 
 use crate::panels::SharedPanel;
 
+/// Format names as shown in the dropdown; each is also the file extension.
+const FORMATS: [&str; 7] = ["7z", "zip", "tar", "tar.gz", "tar.bz2", "tar.xz", "tar.zst"];
+
+/// Replaces a known archive extension on `name` with `.{format}`, or appends it
+/// if the name has none (so changing the format never yields e.g. a zip named .7z).
+fn with_format_extension(name: &str, format: &str) -> String {
+    let lower = name.to_lowercase();
+    // Longest first so ".tar.gz" wins over ".gz"-less ".tar".
+    let mut exts: Vec<&str> = FORMATS.to_vec();
+    exts.sort_by_key(|e| std::cmp::Reverse(e.len()));
+    for ext in exts {
+        let suffix = format!(".{}", ext);
+        if lower.ends_with(&suffix) && name.len() > suffix.len() {
+            return format!("{}.{}", &name[..name.len() - suffix.len()], format);
+        }
+    }
+    format!("{}.{}", name, format)
+}
+
 pub fn show(state: &SharedPanel, paths: &[PathBuf], password_protect: bool) {
-    let current = { state.borrow().current_path.clone() };
+    // When browsing inside an archive, default to the folder that contains it
+    // (the virtual "x.7z [archive]/..." path is not a real folder).
+    let current = {
+        let cur = state.borrow().current_path.clone();
+        match crate::archive::browse::parse_archive_path(&cur) {
+            Some((archive, _)) => archive.parent().map(|p| p.to_path_buf()).unwrap_or(cur),
+            None => cur,
+        }
+    };
 
     let dialog = adw::Dialog::builder()
-        .title(if password_protect { "Password Protect Archive" } else { "Create Archive" })
-        .content_width(500)
-        .content_height(420)
+        .title(if password_protect { "Password-Protected Archive" } else { "Create Archive" })
+        .content_width(460)
         .build();
 
+    // GNOME dialog pattern: Cancel on the left, the action on the right of the header.
     let toolbar_view = adw::ToolbarView::new();
-    let header = adw::HeaderBar::new();
+    let header = adw::HeaderBar::builder()
+        .show_start_title_buttons(false)
+        .show_end_title_buttons(false)
+        .build();
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let build_button = gtk::Button::with_label("Create");
+    build_button.add_css_class("suggested-action");
+    header.pack_start(&cancel_button);
+    header.pack_end(&build_button);
     toolbar_view.add_top_bar(&header);
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
     content.set_margin_top(12);
-    content.set_margin_bottom(12);
+    content.set_margin_bottom(18);
     content.set_margin_start(12);
     content.set_margin_end(12);
 
-    // Archive name
-    let name_label = gtk::Label::builder()
-        .label("Archive name:")
-        .xalign(0.0)
-        .build();
-    content.append(&name_label);
+    let what = if paths.len() == 1 {
+        paths[0].file_name().map(|n| format!("\u{201c}{}\u{201d}", n.to_string_lossy())).unwrap_or_default()
+    } else {
+        format!("{} items", paths.len())
+    };
 
+    // --- Archive ---
     let now = chrono::Local::now();
     let timestamp = now.format("%Y-%m-%d_%H-%M-%S").to_string();
     let default_name = if paths.len() == 1 {
@@ -41,145 +76,133 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf], password_protect: bool) {
     } else {
         format!("archive_{}.7z", timestamp)
     };
-    let name_entry = gtk::Entry::builder()
+    let archive_group = adw::PreferencesGroup::builder()
+        .title("Archive")
+        .description(format!("Packs {}", what))
+        .build();
+    let name_entry = adw::EntryRow::builder()
+        .title("File name")
         .text(&default_name)
-        .hexpand(true)
         .build();
-    content.append(&name_entry);
+    archive_group.add(&name_entry);
 
-    // Format
-    let fmt_label = gtk::Label::builder()
-        .label("Format:")
-        .xalign(0.0)
+    let fmt_combo = adw::ComboRow::builder()
+        .title("Format")
+        .model(&gtk::StringList::new(&FORMATS))
         .build();
-    content.append(&fmt_label);
+    archive_group.add(&fmt_combo);
 
-    let fmt_combo = gtk::DropDown::from_strings(&["7z", "zip", "tar", "tar.gz", "tar.bz2", "tar.xz", "tar.zst"]);
-    fmt_combo.set_selected(0);
-    content.append(&fmt_combo);
-
-    // Compression level
-    let level_label = gtk::Label::builder()
-        .label("Compression level:")
-        .xalign(0.0)
+    let level_combo = adw::ComboRow::builder()
+        .title("Compression")
+        .subtitle("Higher levels are smaller but slower")
+        .model(&gtk::StringList::new(&[
+            "Store (no compression)",
+            "Fastest",
+            "Fast",
+            "Normal",
+            "Maximum",
+            "Ultra",
+        ]))
+        .selected(3)
         .build();
-    content.append(&level_label);
+    archive_group.add(&level_combo);
+    content.append(&archive_group);
 
-    let level_combo = gtk::DropDown::from_strings(&[
-        "Store (no compression)",
-        "Fastest",
-        "Fast",
-        "Normal",
-        "Maximum",
-        "Ultra",
-    ]);
-    level_combo.set_selected(3);
-    content.append(&level_combo);
-
-    // Encryption section
-    let enc_label = gtk::Label::builder()
-        .label("Encryption")
-        .xalign(0.0)
+    // --- Location ---
+    let out_dir = std::rc::Rc::new(std::cell::RefCell::new(current.clone()));
+    let location_group = adw::PreferencesGroup::new();
+    let out_row = adw::ActionRow::builder()
+        .title("Save in")
+        .subtitle(crate::panels::display_path(&current))
+        .activatable(true)
         .build();
-    enc_label.add_css_class("heading");
-    content.append(&enc_label);
-
-    let enc_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-
-    let password_label = gtk::Label::builder()
-        .label("Password:")
-        .xalign(0.0)
-        .build();
-    let password_entry = gtk::PasswordEntry::builder()
-        .show_peek_icon(true)
-        .placeholder_text("Optional")
-        .hexpand(true)
-        .build();
-    enc_box.append(&password_label);
-    enc_box.append(&password_entry);
-
-    let encrypt_names_check = gtk::CheckButton::builder()
-        .label("Encrypt file names")
-        .margin_top(4)
-        .build();
-    encrypt_names_check.set_tooltip_text(Some("Only the 7z format supports encrypting file names"));
-    if password_protect {
-        encrypt_names_check.set_active(true);
-    }
-    enc_box.append(&encrypt_names_check);
-    content.append(&enc_box);
+    out_row.add_css_class("property");
+    let out_icon = gtk::Image::from_icon_name("folder-open-symbolic");
+    out_row.add_suffix(&out_icon);
+    location_group.add(&out_row);
+    content.append(&location_group);
 
     {
-        let chk = encrypt_names_check.clone();
-        let combo = fmt_combo.clone();
-        combo.connect_selected_notify(move |c| {
-            let is_7z = c.selected() == 0;
-            chk.set_sensitive(is_7z);
-            if !is_7z {
-                chk.set_active(false);
-            }
-        });
-    }
-
-    // Output path
-    let out_label = gtk::Label::builder()
-        .label("Output folder:")
-        .xalign(0.0)
-        .build();
-    content.append(&out_label);
-
-    let out_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let out_entry = gtk::Entry::builder()
-        .text(&*current.to_string_lossy())
-        .hexpand(true)
-        .sensitive(false)
-        .build();
-    let out_button = gtk::Button::from_icon_name("folder-open-symbolic");
-    out_button.set_tooltip_text(Some("Browse output folder"));
-    out_row.append(&out_entry);
-    out_row.append(&out_button);
-    content.append(&out_row);
-
-    {
-        let out_entry_ref = out_entry.clone();
-        out_button.connect_clicked(move |_| {
-            let dialog = gtk::FileDialog::builder()
-                .title("Select Output Folder")
+        let out_dir = out_dir.clone();
+        out_row.connect_activated(move |row| {
+            let chooser = gtk::FileDialog::builder()
+                .title("Choose Where to Save the Archive")
+                .accept_label("Select")
+                .initial_folder(&gio::File::for_path(&*out_dir.borrow()))
                 .build();
-            let out_ref = out_entry_ref.clone();
-            dialog.select_folder(None::<&gtk::Window>, None::<&gio::Cancellable>, move |result| {
+            let out_dir = out_dir.clone();
+            let row = row.clone();
+            chooser.select_folder(crate::utils::parent_window().as_ref(), None::<&gio::Cancellable>, move |result| {
                 if let Ok(folder) = result {
                     if let Some(path) = folder.path() {
-                        out_ref.set_text(&*path.to_string_lossy());
+                        row.set_subtitle(&crate::panels::display_path(&path));
+                        *out_dir.borrow_mut() = path;
                     }
                 }
             });
         });
     }
 
-    toolbar_view.set_content(Some(&content));
-
-    let cancel_button = gtk::Button::builder()
-        .label("Cancel")
+    // --- Encryption ---
+    let enc_group = adw::PreferencesGroup::builder()
+        .title("Encryption")
+        .description(if password_protect {
+            "Anyone opening the archive will need this password"
+        } else {
+            "Optional. Leave the password empty for no encryption."
+        })
         .build();
-
-    let build_button = gtk::Button::builder()
-        .label("Build")
+    let password_entry = adw::PasswordEntryRow::builder()
+        .title("Password")
         .build();
-    build_button.add_css_class("suggested-action");
+    enc_group.add(&password_entry);
 
-    let bottom_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    bottom_bar.set_margin_top(8);
-    bottom_bar.set_margin_bottom(8);
-    bottom_bar.set_margin_start(12);
-    bottom_bar.set_margin_end(12);
-    bottom_bar.append(&cancel_button);
-    bottom_bar.set_halign(gtk::Align::End);
-    bottom_bar.set_hexpand(true);
-    bottom_bar.append(&build_button);
-    toolbar_view.add_bottom_bar(&bottom_bar);
+    let encrypt_names_check = adw::SwitchRow::builder()
+        .title("Encrypt file names")
+        .subtitle("Hide the list of files until the password is entered")
+        .active(password_protect)
+        .build();
+    enc_group.add(&encrypt_names_check);
+    content.append(&enc_group);
 
+    {
+        let chk = encrypt_names_check.clone();
+        let pw_row = password_entry.clone();
+        let group = enc_group.clone();
+        let name_ref = name_entry.clone();
+        fmt_combo.connect_selected_notify(move |c| {
+            let format = FORMATS.get(c.selected() as usize).copied().unwrap_or("7z");
+            let current_name = name_ref.text().to_string();
+            if !current_name.is_empty() {
+                name_ref.set_text(&with_format_extension(&current_name, format));
+            }
+            // Only 7z can hide file names; tar can't be encrypted at all.
+            let is_7z = format == "7z";
+            let is_tar = format.starts_with("tar");
+            chk.set_sensitive(is_7z);
+            if !is_7z {
+                chk.set_active(false);
+            }
+            pw_row.set_sensitive(!is_tar);
+            group.set_description(Some(if is_tar {
+                "tar archives can\u{2019}t be encrypted. Choose 7z or zip to set a password."
+            } else if !is_7z {
+                "zip encrypts file contents only; file names stay visible."
+            } else {
+                "Optional. Leave the password empty for no encryption."
+            }));
+        });
+    }
+
+    let clamp = adw::Clamp::builder().maximum_size(520).child(&content).build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&clamp)
+        .build();
+    toolbar_view.set_content(Some(&scrolled));
     dialog.set_child(Some(&toolbar_view));
+    dialog.set_default_widget(Some(&build_button));
 
     let dialog_ref = dialog.clone();
     cancel_button.connect_clicked(move |_| {
@@ -191,22 +214,21 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf], password_protect: bool) {
     let dialog_for_build = dialog.clone();
     let password_entry_focus = password_entry.clone();
     build_button.connect_clicked(move |_| {
-        let name = name_entry.text().to_string();
         let fmt_idx = fmt_combo.selected();
-        let format = match fmt_idx {
-            0 => "7z",
-            1 => "zip",
-            2 => "tar",
-            3 => "tar.gz",
-            4 => "tar.bz2",
-            5 => "tar.xz",
-            6 => "tar.zst",
-            _ => "7z",
-        };
+        let format = FORMATS.get(fmt_idx as usize).copied().unwrap_or("7z");
+        let typed = name_entry.text().trim().to_string();
+        if typed.is_empty() {
+            name_entry.grab_focus();
+            return;
+        }
+        let name = with_format_extension(&typed, format);
+        if name != typed {
+            name_entry.set_text(&name);
+        }
         let level = level_combo.selected();
         let password = password_entry.text().to_string();
         let encrypt_names = encrypt_names_check.is_active() && format == "7z";
-        let output_dir = PathBuf::from(out_entry.text().to_string());
+        let output_dir = out_dir.borrow().clone();
 
         if !password.is_empty() && format.starts_with("tar") {
             let alert = adw::AlertDialog::builder()
@@ -289,7 +311,7 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf], password_protect: bool) {
                             }
                             let d = adw::AlertDialog::builder()
                                 .heading("Create Archive Failed")
-                                .body(&e)
+                                .body(crate::utils::humanize_error(&e))
                                 .build();
                             d.add_response("ok", "OK");
                             d.present(crate::utils::parent_window().as_ref());
@@ -320,7 +342,6 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf], password_protect: bool) {
             let d = d_build.clone();
             let op = out_path.clone();
             let name_entry_focus = name_entry.clone();
-            let dfb_for_conflict = d_build.clone();
             conflict.connect_response(None, move |_, resp| {
                 if resp == "overwrite" {
                     let _ = std::fs::remove_file(&op);
@@ -339,5 +360,21 @@ pub fn show(state: &SharedPanel, paths: &[PathBuf], password_protect: bool) {
 
     if password_protect {
         password_entry_focus.grab_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_format_extension;
+
+    #[test]
+    fn extension_follows_format() {
+        assert_eq!(with_format_extension("a_2026.7z", "zip"), "a_2026.zip");
+        assert_eq!(with_format_extension("a.tar.gz", "7z"), "a.7z");
+        assert_eq!(with_format_extension("a.zip", "tar.zst"), "a.tar.zst");
+        assert_eq!(with_format_extension("a.tar", "tar.xz"), "a.tar.xz");
+        assert_eq!(with_format_extension("backup", "7z"), "backup.7z");
+        assert_eq!(with_format_extension("photos.ZIP", "zip"), "photos.zip");
+        assert_eq!(with_format_extension("v1.2", "zip"), "v1.2.zip");
     }
 }

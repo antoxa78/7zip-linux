@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
+use crate::utils::NEED_PASSWORD;
+
 fn is_tar_compressed(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.contains(".tar.") && (lower.ends_with(".gz") || lower.ends_with(".bz2")
@@ -27,6 +29,53 @@ pub enum OverwriteMode {
     AutoRename,
 }
 
+/// Decompresses the outer layer of a `.tar.gz`-style archive into a private temp dir
+/// and returns (temp dir, inner tar path). The caller must remove the temp dir.
+async fn unpack_outer_layer(
+    archive: &Path,
+    password: Option<&str>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let tmp = crate::utils::unique_temp_dir("tar")
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+
+    let mut phase1 = tokio::process::Command::new("7z");
+    phase1.arg("e").arg(archive).arg(format!("-o{}", tmp.display())).arg("-y");
+    if let Some(pw) = password {
+        phase1.arg(format!("-p{}", pw));
+    }
+    let out1 = match phase1.stdin(std::process::Stdio::null()).output().await {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(format!("Failed to run 7z: {}", e));
+        }
+    };
+    if !out1.status.success() {
+        let stderr = String::from_utf8_lossy(&out1.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&out1.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&tmp);
+        if needs_password(&stderr, &stdout) {
+            return Err(NEED_PASSWORD.to_string());
+        }
+        return Err(stderr);
+    }
+
+    let inner = std::fs::read_dir(&tmp)
+        .ok()
+        .and_then(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.is_file())
+        });
+    match inner {
+        Some(inner) => Ok((tmp, inner)),
+        None => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err("Inner tar not found in compressed archive".to_string())
+        }
+    }
+}
+
 pub async fn extract_archive(
     archive: &Path,
     options: &ExtractOptions,
@@ -39,37 +88,7 @@ pub async fn extract_archive(
         .unwrap_or("");
 
     if is_tar_compressed(archive_name) {
-        let tmp = std::env::temp_dir().join("sevenzip-gui-list");
-        let _ = std::fs::create_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&tmp);
-
-        let mut phase1 = tokio::process::Command::new("7z");
-        phase1.arg("e").arg(archive).arg(format!("-o{}", tmp.display())).arg("-y");
-        if let Some(ref pw) = options.password {
-            phase1.arg(format!("-p{}", pw));
-        }
-        let out1 = phase1.stdin(std::process::Stdio::null()).output().await
-            .map_err(|e| format!("Failed to run 7z: {}", e))?;
-        if !out1.status.success() {
-            let stderr = String::from_utf8_lossy(&out1.stderr).to_string();
-            let stdout = String::from_utf8_lossy(&out1.stdout).to_string();
-            let _ = std::fs::remove_dir_all(&tmp);
-            if needs_password(&stderr, &stdout) {
-                return Err("__NEED_PASSWORD__".to_string());
-            }
-            return Err(stderr);
-        }
-
-        let inner_tar = std::fs::read_dir(&tmp)
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok())
-            .find(|e| e.path().is_file() && e.path() != *archive)
-            .map(|e| e.path())
-            .ok_or_else(|| {
-                let _ = std::fs::remove_dir_all(&tmp);
-                "Inner tar not found in compressed archive".to_string()
-            })?;
-
+        let (tmp, inner_tar) = unpack_outer_layer(archive, options.password.as_deref()).await?;
         let result = extract_archive_inner(&inner_tar, options, progress_tx, cancel, pause).await;
         let _ = std::fs::remove_dir_all(&tmp);
         result
@@ -115,6 +134,7 @@ async fn extract_archive_inner(
         Some(id) => id,
         None => return Err("7z process exited immediately".to_string()),
     };
+    let stderr_task = super::proc::drain_stderr(&mut child);
     let mut stdout = match child.stdout.take() {
         Some(s) => s,
         None => return Err("Failed to capture 7z stdout".to_string()),
@@ -182,138 +202,130 @@ async fn extract_archive_inner(
         }
     }
 
-    let output = child.wait_with_output().await
+    let status = child.wait().await
         .map_err(|e| format!("7z failed: {}", e))?;
+    let stderr = super::proc::collect_stderr(stderr_task).await;
 
-    if output.status.success() {
+    if status.success() {
         if let Some(ref tx) = progress_tx {
             let _ = tx.send(100).await;
         }
         Ok(String::from_utf8_lossy(&stdout_buf).to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
         if needs_password(&stderr, &stdout_str) {
-            Err("__NEED_PASSWORD__".to_string())
+            Err(NEED_PASSWORD.to_string())
+        } else if stderr.trim().is_empty() {
+            Err(stdout_str)
         } else {
             Err(stderr)
         }
     }
 }
 
-fn needs_password(stderr: &str, stdout: &str) -> bool {
+/// True only when 7z's output points at a missing or wrong password.
+/// (Plain "cannot open" errors mean "not an archive / corrupt", not "encrypted".)
+pub fn needs_password(stderr: &str, stdout: &str) -> bool {
     let combined = format!("{} {}", stderr, stdout).to_lowercase();
     combined.contains("enter password")
         || combined.contains("wrong password")
-        || combined.contains("cannot open")
-        || combined.contains("can not open")
-        || combined.contains("encrypted = +")
+        || combined.contains("encrypted archive")
         || combined.contains("nohdr-password")
 }
 
+/// Runs `7z x` for a single entry (file or folder) into `out_dir`, keeping full paths.
+async fn run_extract_full_paths(
+    archive: &Path,
+    internal_path: &str,
+    out_dir: &Path,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let mut cmd = tokio::process::Command::new("7z");
+    cmd.arg("x")
+        .arg(archive)
+        .arg(internal_path)
+        .arg(format!("-o{}", out_dir.display()))
+        .arg("-y");
+    if let Some(pw) = password {
+        cmd.arg(format!("-p{}", pw));
+    }
+    let output = cmd
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run 7z: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if needs_password(&stderr, &stdout) {
+            Err(NEED_PASSWORD.to_string())
+        } else if stderr.trim().is_empty() {
+            Err(stdout)
+        } else {
+            Err(stderr)
+        }
+    }
+}
+
+/// Creates a hidden staging directory inside `dest_dir` (so the final move is a cheap
+/// rename on the same filesystem), falling back to a private temp dir.
+fn make_stage_dir(dest_dir: &Path) -> Result<PathBuf, String> {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let candidate = dest_dir.join(format!(".7zip-linux-extract-{}-{}", std::process::id(), n));
+    if std::fs::create_dir(&candidate).is_ok() {
+        return Ok(candidate);
+    }
+    crate::utils::unique_temp_dir("extract").map_err(|e| format!("Failed to create temp dir: {}", e))
+}
+
+/// Extracts one entry (a file *or a folder with all its contents*) from an archive and
+/// places it at `dest_dir/<entry name>`, preserving the folder structure below it.
+/// Existing folders are merged and existing files overwritten.
 pub async fn extract_entry(
     archive: &Path,
     internal_path: &str,
     dest_dir: &Path,
     password: Option<&str>,
 ) -> Result<(), String> {
-    if internal_path.is_empty() {
+    let internal = internal_path.trim_matches('/').to_string();
+    if internal.is_empty() {
         return Err("Internal path is empty".to_string());
     }
     std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    let name = internal.rsplit('/').next().unwrap_or(&internal).to_string();
 
     let archive_name = archive.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
-    if is_tar_compressed(archive_name) {
-        let tmp = std::env::temp_dir().join("sevenzip-gui-list");
-        let _ = std::fs::create_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&tmp);
+    let stage = make_stage_dir(dest_dir)?;
 
-        let mut phase1 = tokio::process::Command::new("7z");
-        phase1.arg("e").arg(archive).arg(format!("-o{}", tmp.display())).arg("-y");
-        if let Some(pw) = password {
-            phase1.arg(format!("-p{}", pw));
-        }
-        let out1 = phase1.stdin(std::process::Stdio::null()).output().await
-            .map_err(|e| format!("Failed to run 7z: {}", e))?;
-        if !out1.status.success() {
-            let stderr = String::from_utf8_lossy(&out1.stderr).to_string();
-            let stdout = String::from_utf8_lossy(&out1.stdout).to_string();
-            let _ = std::fs::remove_dir_all(&tmp);
-            if needs_password(&stderr, &stdout) {
-                return Err("__NEED_PASSWORD__".to_string());
-            }
-            return Err(stderr);
-        }
-
-        let inner_tar = std::fs::read_dir(&tmp)
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok())
-            .find(|e| e.path().is_file() && e.path() != *archive)
-            .map(|e| e.path())
-            .ok_or_else(|| {
+    let extracted = if is_tar_compressed(archive_name) {
+        match unpack_outer_layer(archive, password).await {
+            Ok((tmp, inner_tar)) => {
+                let r = run_extract_full_paths(&inner_tar, &internal, &stage, password).await;
                 let _ = std::fs::remove_dir_all(&tmp);
-                "Inner tar not found in compressed archive".to_string()
-            })?;
-
-        let is_dir = internal_path.ends_with('/');
-        let cmd = if is_dir { "x" } else { "e" };
-        let mut phase2 = tokio::process::Command::new("7z");
-        phase2.arg(cmd).arg(&inner_tar).arg(internal_path)
-            .arg(format!("-o{}", dest_dir.display())).arg("-y");
-        if let Some(pw) = password {
-            phase2.arg(format!("-p{}", pw));
-        }
-        let out2 = phase2.stdin(std::process::Stdio::null()).output().await
-            .map_err(|e| format!("Failed to run 7z: {}", e))?;
-        let _ = std::fs::remove_dir_all(&tmp);
-
-        if out2.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&out2.stderr).to_string();
-            let stdout = String::from_utf8_lossy(&out2.stdout).to_string();
-            if needs_password(&stderr, &stdout) {
-                Err("__NEED_PASSWORD__".to_string())
-            } else {
-                Err(stderr)
+                r
             }
+            Err(e) => Err(e),
         }
     } else {
-        let is_dir = internal_path.ends_with('/');
-        let cmd = if is_dir { "x" } else { "e" };
+        run_extract_full_paths(archive, &internal, &stage, password).await
+    };
 
-        let mut args = vec![
-            cmd.to_string(),
-            archive.to_string_lossy().to_string(),
-            internal_path.to_string(),
-            format!("-o{}", dest_dir.display()),
-            "-y".to_string(),
-        ];
-
-        if let Some(pw) = password {
-            args.push(format!("-p{}", pw));
+    let result = extracted.and_then(|_| {
+        let item = stage.join(&internal);
+        if std::fs::symlink_metadata(&item).is_err() {
+            return Err(format!("\"{}\" was not found in the archive", internal));
         }
+        crate::utils::fsops::move_merge(&item, &dest_dir.join(&name))
+            .map_err(|e| format!("Failed to place extracted item: {}", e))
+    });
 
-        let output = tokio::process::Command::new("7z")
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .map_err(|e| format!("Failed to run 7z: {}", e))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            if needs_password(&stderr, &stdout) {
-                Err("__NEED_PASSWORD__".to_string())
-            } else {
-                Err(stderr)
-            }
-        }
-    }
+    let _ = std::fs::remove_dir_all(&stage);
+    result
 }
