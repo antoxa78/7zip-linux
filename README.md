@@ -51,9 +51,13 @@ From the hamburger menu → **File Associations** → **Install File Manager Scr
 
 ## Support
 
-If you find this project useful, you can support its development:
+Enjoying this project? A small donation is greatly appreciated and helps keep it going:
 
-[![Donate with PayPal](https://img.shields.io/badge/Donate%20with%20PayPal-0070ba?style=for-the-badge&logo=paypal)](https://paypal.me/antoxab1978)
+<p align="center">
+  <a href="https://www.paypal.me/antoxab1978" target="_blank">
+    <img src="https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif" alt="Donate with PayPal" />
+  </a>
+</p>
 
 ## License
 
