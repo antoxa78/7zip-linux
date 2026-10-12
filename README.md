@@ -53,7 +53,7 @@ From the hamburger menu → **File Associations** → **Install File Manager Scr
 
 If you find this project useful, you can support its development:
 
-[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/antoxab1978)
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=for-the-badge)](https://paypal.me/antoxab1978)
 
 ## License
 
