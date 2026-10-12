@@ -49,6 +49,12 @@ From the hamburger menu → **File Associations** → **Install File Manager Scr
 | Thunar | `~/.config/Thunar/uca.xml` |
 | Dolphin | `~/.local/share/kservices5/servicemenus/` |
 
+## Support
+
+If you find this project useful, you can support its development:
+
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/antoxab1978)
+
 ## License
 
 GPL-3.0-or-later
